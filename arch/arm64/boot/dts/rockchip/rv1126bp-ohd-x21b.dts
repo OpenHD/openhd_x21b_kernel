@@ -10,7 +10,7 @@
 	compatible = "openhd,x21b", "rockchip,rv1126b";
 
 	chosen {
-		bootargs = "earlycon=uart8250,mmio32,0x20810000 console=ttyFIQ0 root=PARTUUID=614e0000-0000 rw rootwait coherent_pool=32K";
+		bootargs = "earlycon=uart8250,mmio32,0x20810000 console=ttyFIQ0 root=/dev/mtdblock4 coherent_pool=32K";
 	};
 
 	// Input is 7-23V but linux dont allow variable voltage fixed rg so fix at 12v
@@ -258,6 +258,14 @@
 		spi-rx-bus-width = <4>;
 		spi-tx-bus-width = <1>;
 	};
+};
+
+&mpp_srv {
+	status = "okay";
+};
+
+&mpp_vcodec {
+	status = "okay";
 };
 
 &rkdvbm {
