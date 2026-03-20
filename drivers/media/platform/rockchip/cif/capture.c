@@ -454,6 +454,62 @@ static const struct cif_input_fmt in_fmts[] = {
 		.fmt_type	= CIF_FMT_TYPE_YUV,
 		.field		= V4L2_FIELD_INTERLACED,
 	}, {
+		.mbus_code	= MEDIA_BUS_FMT_YUYV8_1X16,
+		.dvp_fmt_val	= YUV_INPUT_422 | YUV_INPUT_ORDER_YUYV,
+		.csi_fmt_val	= CSI_WRDDR_TYPE_YUV422,
+		.csi_yuv_order	= CSI_YUV_INPUT_ORDER_YUYV,
+		.fmt_type	= CIF_FMT_TYPE_YUV,
+		.field		= V4L2_FIELD_NONE,
+	}, {
+		.mbus_code	= MEDIA_BUS_FMT_YUYV8_1X16,
+		.dvp_fmt_val	= YUV_INPUT_422 | YUV_INPUT_ORDER_YUYV,
+		.csi_fmt_val	= CSI_WRDDR_TYPE_YUV422,
+		.csi_yuv_order	= CSI_YUV_INPUT_ORDER_YUYV,
+		.fmt_type	= CIF_FMT_TYPE_YUV,
+		.field		= V4L2_FIELD_INTERLACED,
+	}, {
+		.mbus_code	= MEDIA_BUS_FMT_YVYU8_1X16,
+		.dvp_fmt_val	= YUV_INPUT_422 | YUV_INPUT_ORDER_YVYU,
+		.csi_fmt_val	= CSI_WRDDR_TYPE_YUV422,
+		.csi_yuv_order	= CSI_YUV_INPUT_ORDER_YVYU,
+		.fmt_type	= CIF_FMT_TYPE_YUV,
+		.field		= V4L2_FIELD_NONE,
+	}, {
+		.mbus_code	= MEDIA_BUS_FMT_YVYU8_1X16,
+		.dvp_fmt_val	= YUV_INPUT_422 | YUV_INPUT_ORDER_YVYU,
+		.csi_fmt_val	= CSI_WRDDR_TYPE_YUV422,
+		.csi_yuv_order	= CSI_YUV_INPUT_ORDER_YVYU,
+		.fmt_type	= CIF_FMT_TYPE_YUV,
+		.field		= V4L2_FIELD_INTERLACED,
+	}, {
+		.mbus_code	= MEDIA_BUS_FMT_UYVY8_1X16,
+		.dvp_fmt_val	= YUV_INPUT_422 | YUV_INPUT_ORDER_UYVY,
+		.csi_fmt_val	= CSI_WRDDR_TYPE_YUV422,
+		.csi_yuv_order	= CSI_YUV_INPUT_ORDER_UYVY,
+		.fmt_type	= CIF_FMT_TYPE_YUV,
+		.field		= V4L2_FIELD_NONE,
+	}, {
+		.mbus_code	= MEDIA_BUS_FMT_UYVY8_1X16,
+		.dvp_fmt_val	= YUV_INPUT_422 | YUV_INPUT_ORDER_UYVY,
+		.csi_fmt_val	= CSI_WRDDR_TYPE_YUV422,
+		.csi_yuv_order	= CSI_YUV_INPUT_ORDER_UYVY,
+		.fmt_type	= CIF_FMT_TYPE_YUV,
+		.field		= V4L2_FIELD_INTERLACED,
+	}, {
+		.mbus_code	= MEDIA_BUS_FMT_VYUY8_1X16,
+		.dvp_fmt_val	= YUV_INPUT_422 | YUV_INPUT_ORDER_VYUY,
+		.csi_fmt_val	= CSI_WRDDR_TYPE_YUV422,
+		.csi_yuv_order	= CSI_YUV_INPUT_ORDER_VYUY,
+		.fmt_type	= CIF_FMT_TYPE_YUV,
+		.field		= V4L2_FIELD_NONE,
+	}, {
+		.mbus_code	= MEDIA_BUS_FMT_VYUY8_1X16,
+		.dvp_fmt_val	= YUV_INPUT_422 | YUV_INPUT_ORDER_VYUY,
+		.csi_fmt_val	= CSI_WRDDR_TYPE_YUV422,
+		.csi_yuv_order	= CSI_YUV_INPUT_ORDER_VYUY,
+		.fmt_type	= CIF_FMT_TYPE_YUV,
+		.field		= V4L2_FIELD_INTERLACED,
+	}, {
 		.mbus_code	= MEDIA_BUS_FMT_SBGGR8_1X8,
 		.dvp_fmt_val	= INPUT_MODE_RAW | RAW_DATA_WIDTH_8,
 		.csi_fmt_val	= CSI_WRDDR_TYPE_RAW8,
@@ -676,6 +732,10 @@ static int rkcif_output_fmt_check(struct rkcif_stream *stream,
 	case MEDIA_BUS_FMT_YVYU8_2X8:
 	case MEDIA_BUS_FMT_UYVY8_2X8:
 	case MEDIA_BUS_FMT_VYUY8_2X8:
+	case MEDIA_BUS_FMT_YUYV8_1X16:
+	case MEDIA_BUS_FMT_YVYU8_1X16:
+	case MEDIA_BUS_FMT_UYVY8_1X16:
+	case MEDIA_BUS_FMT_VYUY8_1X16:
 		if (output_fmt->fourcc == V4L2_PIX_FMT_NV16 ||
 		    output_fmt->fourcc == V4L2_PIX_FMT_NV61 ||
 		    output_fmt->fourcc == V4L2_PIX_FMT_NV12 ||
@@ -978,6 +1038,10 @@ static unsigned char get_data_type(u32 pixelformat, u8 cmd_mode_en, u8 dsi_input
 	case MEDIA_BUS_FMT_VYUY8_2X8:
 	case MEDIA_BUS_FMT_YUYV8_2X8:
 	case MEDIA_BUS_FMT_YVYU8_2X8:
+	case MEDIA_BUS_FMT_UYVY8_1X16:
+	case MEDIA_BUS_FMT_VYUY8_1X16:
+	case MEDIA_BUS_FMT_YUYV8_1X16:
+	case MEDIA_BUS_FMT_YVYU8_1X16:
 		return 0x1e;
 	case MEDIA_BUS_FMT_RGB888_1X24:
 	case MEDIA_BUS_FMT_BGR888_1X24:
@@ -6581,12 +6645,20 @@ static int rkcif_create_dummy_buf(struct rkcif_stream *stream)
 
 	for (i = 0; i < hw->dev_num; i++) {
 		tmp_dev = hw->cif_dev[i];
+		if (!tmp_dev) {
+			v4l2_warn(&dev->v4l2_dev,
+				  "%s: hw->cif_dev[%d] is NULL\n",
+				  __func__, i);
+			continue;
+		}
+
 		if (tmp_dev->terminal_sensor.sd) {
 			for (j = 0; j < 32; j++) {
 				memset(&fie, 0, sizeof(fie));
 				fie.index = j;
 				fie.pad = 0;
 				fie.which = V4L2_SUBDEV_FORMAT_ACTIVE;
+
 				ret = v4l2_subdev_call(tmp_dev->terminal_sensor.sd,
 						       pad, enum_frame_interval,
 						       NULL, &fie);
@@ -6597,22 +6669,36 @@ static int rkcif_create_dummy_buf(struct rkcif_stream *stream)
 						size = fie.width * fie.height * 3;
 					else
 						size = fie.width * fie.height * 2;
-					v4l2_dbg(1, rkcif_debug, &dev->v4l2_dev,
-						 "%s enum fmt, width %d, height %d\n",
-						 __func__, fie.width, fie.height);
+
+					v4l2_info(&dev->v4l2_dev,
+						  "%s: dev[%d] sensor=%s enum_frame_interval[%d]: "
+						  "code=0x%x %ux%u interval=%u/%u calc_size=%u\n",
+						  __func__, i,
+						  tmp_dev->terminal_sensor.sd->name,
+						  j, fie.code, fie.width, fie.height,
+						  fie.interval.numerator,
+						  fie.interval.denominator,
+						  size);
 				} else {
+					v4l2_dbg(1, rkcif_debug, &dev->v4l2_dev,
+						 "%s: dev[%d] sensor=%s enum_frame_interval[%d] ret=%d\n",
+						 __func__, i,
+						 tmp_dev->terminal_sensor.sd->name,
+						 j, ret);
 					break;
 				}
+
 				if (size > max_size)
 					max_size = size;
 			}
-		} else {
-			continue;
 		}
 	}
 
 	if (max_size == 0 && dev->terminal_sensor.sd) {
+		memset(&fmt, 0, sizeof(fmt));
+		fmt.pad = 0;
 		fmt.which = V4L2_SUBDEV_FORMAT_ACTIVE;
+
 		ret = v4l2_subdev_call(dev->terminal_sensor.sd,
 				       pad, get_fmt, NULL, &fmt);
 		if (!ret) {
@@ -6622,19 +6708,31 @@ static int rkcif_create_dummy_buf(struct rkcif_stream *stream)
 				size = fmt.format.width  * fmt.format.height * 3;
 			else
 				size = fmt.format.width * fmt.format.height * 2;
+
 			if (size > max_size)
 				max_size = size;
+		} else {
+			v4l2_err(&dev->v4l2_dev,
+				 "%s: fallback get_fmt failed for sensor=%s ret=%d\n",
+				 __func__, dev->terminal_sensor.sd->name, ret);
 		}
+	} else if (max_size == 0) {
+		v4l2_err(&dev->v4l2_dev,
+			 "%s: no terminal sensor available, cannot size dummy buffer\n",
+			 __func__);
 	}
 
-	dummy_buf->size = max_size;
+	v4l2_info(&dev->v4l2_dev,
+		  "%s: final max_size=%u\n", __func__, max_size);
 
+	dummy_buf->size = max_size;
 	dummy_buf->is_need_vaddr = true;
 	dummy_buf->is_need_dbuf = true;
+
 	ret = rkcif_alloc_buffer(dev, dummy_buf);
 	if (ret) {
 		v4l2_err(&dev->v4l2_dev,
-			 "Failed to allocate the memory for dummy buffer, size %d\n", max_size);
+			 "Failed to allocate the memory for dummy buffer, size %u\n", max_size);
 		return -ENOMEM;
 	}
 
