@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
+ * At this point more a form of art then a driver
+ * Copyright (C) 2026 Luka Panio <lukapanio@gmail.com>
+ *
  * A V4L2 driver for Arducam Pivariety Cameras
  * Copyright (C) 2022 Arducam Technology co., Ltd.
  *
@@ -22,7 +25,8 @@
  #include <media/v4l2-device.h>
  #include <media/v4l2-event.h>
  #include <media/v4l2-fwnode.h>
- 
+ #include <linux/of_graph.h>
+
  #ifdef RADXA 
 #include <linux/rk-camera-module.h>
 #include <linux/rk-preisp.h>
@@ -1548,17 +1552,10 @@ static int pivariety_probe(struct i2c_client *client,
 
         /* Register sensor to V4L2 async framework */
         dev_info(dev, "pivariety: registering subdevice with V4L2 async\n");
-        struct device_node *ep = of_find_node_by_path("/i2c@ff540000/arducam-pivariety@c/port/endpoint@0");        ;
-        if (ep) {
-                pivariety->sd.fwnode = of_fwnode_handle(ep);
-                dev_info(dev, "Hardcoded endpoint fwnode attached.\n");
-            } else {
-                dev_warn(dev, "Failed to find hardcoded endpoint fwnode!\n");
-            }
         ret = v4l2_async_register_subdev_sensor(&pivariety->sd);
         if (ret < 0) {
-        dev_err(dev, "pivariety: subdev registration failed: %d\n", ret);
-        goto error_media_entity;
+                dev_err(dev, "pivariety: subdev registration failed: %d\n", ret);
+                goto error_media_entity;
         }
 
         /* Parse device tree */
