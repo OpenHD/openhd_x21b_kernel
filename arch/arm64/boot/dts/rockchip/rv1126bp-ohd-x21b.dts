@@ -349,6 +349,9 @@
 	status = "okay";
 };
 
-&gmac {
-	snps,reset-gpio = <&gpio5 RK_PA6 GPIO_ACTIVE_LOW>;
+// LED MCU UART
+&uart3 {
+	pinctrl-names = "default";
+	pinctrl-0 = <&uart3m2_xfer_pins>;
+	status = "okay";
 };
