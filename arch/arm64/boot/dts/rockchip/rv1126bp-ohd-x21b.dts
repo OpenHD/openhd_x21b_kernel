@@ -144,7 +144,7 @@
 	pinctrl-0 = <&i2c5m2_pins>;
 	arducam_pivariety: arducam-pivariety@c {
 		status = "okay";
-		compatible = "arducam,arducam-pivariety";
+		compatible = "openhd,camera";
 		reg = <0x0c>;
 		clocks = <&cru CLK_MIPI0_OUT2IO>;
 		clock-names = "xclk";
