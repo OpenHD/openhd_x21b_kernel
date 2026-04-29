@@ -9535,7 +9535,7 @@ static int rkcif_enum_frameintervals(struct file *file, void *fh,
 	struct rkcif_device *dev = stream->cifdev;
 	struct rkcif_sensor_info *sensor = dev->active_sensor;
 	struct v4l2_subdev_frame_interval fi;
-	int ret;
+	//int ret;
 
 	if (fival->index != 0)
 		return -EINVAL;
@@ -9546,14 +9546,14 @@ static int rkcif_enum_frameintervals(struct file *file, void *fh,
 		return -ENODEV;
 	}
 
-	ret = v4l2_subdev_call(sensor->sd, video, g_frame_interval, &fi);
-	if (ret && ret != -ENOIOCTLCMD) {
-		return ret;
-	} else if (ret == -ENOIOCTLCMD) {
+	//ret = v4l2_subdev_call(sensor->sd, video, g_frame_interval, &fi);
+//	if (ret && ret != -ENOIOCTLCMD) {
+//		return ret;
+//	} else if (ret == -ENOIOCTLCMD) {
 		/* Set a default value for sensors not implements ioctl */
 		fi.interval.numerator = 1;
-		fi.interval.denominator = 30;
-	}
+		fi.interval.denominator = 60;
+	//}
 
 	if (dev->hw_dev->adapt_to_usbcamerahal) {
 		fival->type = V4L2_FRMIVAL_TYPE_DISCRETE;
