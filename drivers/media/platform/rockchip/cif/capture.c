@@ -5798,6 +5798,7 @@ static int rkcif_queue_setup(struct vb2_queue *queue,
 		plane_fmt = &pixm->plane_fmt[i];
 		sizes[i] = plane_fmt->sizeimage / height * h;
 	}
+	*num_buffers = 4;
 	stream->total_buf_num = *num_buffers;
 	v4l2_dbg(1, rkcif_debug, &dev->v4l2_dev, "%s count %d, size %d, extended(%d, %d)\n",
 		 v4l2_type_names[queue->type], *num_buffers, sizes[0],
@@ -9552,7 +9553,7 @@ static int rkcif_enum_frameintervals(struct file *file, void *fh,
 //	} else if (ret == -ENOIOCTLCMD) {
 		/* Set a default value for sensors not implements ioctl */
 		fi.interval.numerator = 1;
-		fi.interval.denominator = 60;
+		fi.interval.denominator = 90;
 	//}
 
 	if (dev->hw_dev->adapt_to_usbcamerahal) {
