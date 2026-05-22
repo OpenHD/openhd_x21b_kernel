@@ -112,29 +112,50 @@
 &csi2_dphy0 {
 	status = "okay";
 
-	ports {
+	port@0 {
+		reg = <0>;
 		#address-cells = <1>;
 		#size-cells = <0>;
-		port@0 {
-			reg = <0>;
-			#address-cells = <1>;
-			#size-cells = <0>;
 
-			csi_dphy_input0: endpoint@1 {
-				reg = <1>;
-				remote-endpoint = <&arducam_out1>;
-				data-lanes = <1 2 3 4>;
-			};
-		};
-		port@1 {
+		csi_dphy_input1: endpoint@1 {
 			reg = <1>;
-			#address-cells = <1>;
-			#size-cells = <0>;
+			remote-endpoint = <&runcam_micro_v1_out>;
+			data-lanes = <1 2 3 4>;
+		};
 
-			csidphy0_out: endpoint@0 {
-				reg = <0>;
-				remote-endpoint = <&mipi0_csi2_input>;
-			};
+		csi_dphy_input2: endpoint@2 {
+			reg = <2>;
+			remote-endpoint = <&runcam_micro_v2_out>;
+			data-lanes = <1 2 3 4>;
+		};
+
+		csi_dphy_input3: endpoint@3 {
+			reg = <3>;
+			remote-endpoint = <&runcam_nano_90_out>;
+			data-lanes = <1 2 3 4>;
+		};
+
+		csi_dphy_input4: endpoint@4 {
+			reg = <4>;
+			remote-endpoint = <&runcam_micro_v3_out>;
+			data-lanes = <1 2 3 4>;
+		};
+
+		csi_dphy_input5: endpoint@5 {
+			reg = <4>;
+			remote-endpoint = <&arducam_out>;
+			data-lanes = <1 2 3 4>;
+		};
+	};
+
+	port@1 {
+		reg = <1>;
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		csidphy0_out: endpoint@0 {
+			reg = <0>;
+			remote-endpoint = <&mipi0_csi2_input>;
 		};
 	};
 };
@@ -142,9 +163,94 @@
 &i2c5 {
 	status = "okay";
 	pinctrl-0 = <&i2c5m2_pins>;
+
+	runcam_micro_v1: runcam-micro-v1@21 {
+		compatible = "runcam,micro-v1";
+		status = "okay";
+		reg = <0x21>;
+		clocks = <&cru CLK_MIPI0_OUT2IO>;
+		clock-names = "xvclk";
+		pinctrl-names = "default";
+		pinctrl-0 = <&cam_clk0_pins>;
+		rockchip,camera-module-index = <0>;
+		rockchip,camera-module-facing = "front";
+		rockchip,camera-module-name = "runcam-micro-v1";
+		rockchip,camera-module-lens-name = "default";
+
+		port {
+			runcam_micro_v1_out: endpoint {
+				remote-endpoint = <&csi_dphy_input1>;
+				data-lanes = <1 2 3 4>;
+			};
+		};
+	};
+
+	runcam_micro_v2: runcam-micro-v2@22 {
+		compatible = "runcam,micro-v2";
+		status = "okay";
+		reg = <0x22>;
+		clocks = <&cru CLK_MIPI0_OUT2IO>;
+		clock-names = "xvclk";
+		pinctrl-names = "default";
+		pinctrl-0 = <&cam_clk0_pins>;
+		rockchip,camera-module-index = <0>;
+		rockchip,camera-module-facing = "front";
+		rockchip,camera-module-name = "runcam-micro-v2";
+		rockchip,camera-module-lens-name = "default";
+
+		port {
+			runcam_micro_v2_out: endpoint {
+				remote-endpoint = <&csi_dphy_input2>;
+				data-lanes = <1 2 3 4>;
+			};
+		};
+	};
+
+	runcam_nano_90: runcam-nano-90@23 {
+		compatible = "runcam,nano-90";
+		status = "okay";
+		reg = <0x23>;
+		clocks = <&cru CLK_MIPI0_OUT2IO>;
+		clock-names = "xvclk";
+		pinctrl-names = "default";
+		pinctrl-0 = <&cam_clk0_pins>;
+		rockchip,camera-module-index = <0>;
+		rockchip,camera-module-facing = "front";
+		rockchip,camera-module-name = "runcam-nano-90";
+		rockchip,camera-module-lens-name = "default";
+
+		port {
+			runcam_nano_90_out: endpoint {
+				remote-endpoint = <&csi_dphy_input3>;
+				data-lanes = <1 2 3 4>;
+			};
+		};
+	};
+
+	runcam_micro_v3: runcam-micro-v3@24 {
+		compatible = "runcam,micro-v3";
+		status = "okay";
+		reg = <0x24>;
+		clocks = <&cru CLK_MIPI0_OUT2IO>;
+		clock-names = "xvclk";
+		pinctrl-names = "default";
+		pinctrl-0 = <&cam_clk0_pins>;
+		rockchip,camera-module-index = <0>;
+		rockchip,camera-module-facing = "front";
+		rockchip,camera-module-name = "runcam-micro-v3";
+		rockchip,camera-module-lens-name = "default";
+
+		port {
+			runcam_micro_v3_out: endpoint {
+				remote-endpoint = <&csi_dphy_input4>;
+				data-lanes = <1 2 3 4>;
+			};
+		};
+	};
+
 	arducam_pivariety: arducam-pivariety@c {
 		status = "okay";
-		compatible = "openhd,camera";
+		compatible = "arducam,arducam-pivariety";
 		reg = <0x0c>;
 		clocks = <&cru CLK_MIPI0_OUT2IO>;
 		clock-names = "xclk";
@@ -155,8 +261,8 @@
 		rockchip,camera-module-name = "arducam-pivariety";
 		rockchip,camera-module-lens-name = "default";
 		port {
-			arducam_out1: endpoint {
-				remote-endpoint = <&csi_dphy_input0>;
+			arducam_out: endpoint {
+				remote-endpoint = <&csi_dphy_input5>;
 				data-lanes = <1 2 3 4>;
 			};
 		};
@@ -331,6 +437,7 @@
 
 &usb_drd_dwc3 {
 	status = "okay";
+	dr_mode = "peripheral";
 };
 
 &usb_host_ehci {

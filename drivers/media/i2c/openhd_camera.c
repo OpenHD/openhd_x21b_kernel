@@ -6,6 +6,7 @@
 #include <linux/of.h>
 #include <linux/of_graph.h>
 #include <linux/clk.h>
+#include <asm/unaligned.h>
 #include <linux/gpio/consumer.h>
 #include <media/v4l2-device.h>
 #include <media/v4l2-subdev.h>
@@ -16,8 +17,12 @@
 #include <media/v4l2-async.h>
 #include <linux/delay.h>
 
+#include "openhd_camera.h"
+
 #define OPENHD_WIDTH 1280
 #define OPENHD_HEIGHT 720
+#define RUNCAM_REG_ADDR_LEN	3
+#define RUNCAM_REG_VAL_LEN	4
 
 /* Link frequency for MIPI CSI (in Hz) */
 #define OPENHD_LINK_FREQ_300MHZ    300000000
@@ -30,11 +35,14 @@ static const s64 link_freq_menu_items[] = {
 struct openhd_camera_dev {
 	struct v4l2_subdev sd;
 	struct media_pad pad;
+
+	const struct runcam_model_info *model;
+	const struct runcam_mode *cur_mode;
 	struct v4l2_mbus_framefmt fmt;
 	struct v4l2_ctrl_handler ctrl_handler;
 	struct v4l2_ctrl *link_freq;
 	struct v4l2_ctrl *pixel_rate;
-
+	s64 link_freq_menu;
 
 	struct i2c_client *i2c_client;
 
@@ -51,18 +59,78 @@ struct openhd_camera_dev {
 	const char *len_name;
 };
 
+static int openhd_camera_read32(struct i2c_client *client, u32 reg, u32 *val)
+{
+	u8 addr[RUNCAM_REG_ADDR_LEN];
+	u8 data[RUNCAM_REG_VAL_LEN];
+	struct i2c_msg msgs[2];
+	int ret;
+
+	addr[0] = reg >> 16;
+	addr[1] = reg >> 8;
+	addr[2] = reg;
+
+	msgs[0].addr = client->addr;
+	msgs[0].flags = 0;
+	msgs[0].len = sizeof(addr);
+	msgs[0].buf = addr;
+
+	msgs[1].addr = client->addr;
+	msgs[1].flags = I2C_M_RD;
+	msgs[1].len = sizeof(data);
+	msgs[1].buf = data;
+
+	ret = i2c_transfer(client->adapter, msgs, ARRAY_SIZE(msgs));
+	if (ret != ARRAY_SIZE(msgs))
+		return ret < 0 ? ret : -EIO;
+
+	*val = get_unaligned_be32(data);
+
+	return 0;
+}
+
+static int openhd_camera_write32(struct i2c_client *client, u32 reg, u32 val)
+{
+	u8 buf[RUNCAM_REG_ADDR_LEN + RUNCAM_REG_VAL_LEN];
+	int ret;
+
+	buf[0] = reg >> 16;
+	buf[1] = reg >> 8;
+	buf[2] = reg;
+	put_unaligned_be32(val, &buf[3]);
+
+	ret = i2c_master_send(client, buf, sizeof(buf));
+	if (ret != sizeof(buf))
+		return ret < 0 ? ret : -EIO;
+
+	return 0;
+}
+
+static u64 openhd_pixel_rate(const struct runcam_mode *mode, u32 lanes)
+{
+	return (u64)mode->link_freq_hz * lanes / 8;
+}
+
+static void openhd_update_link_controls(struct openhd_camera_dev *sensor)
+{
+	u64 prate = openhd_pixel_rate(sensor->cur_mode, sensor->csi_lanes);
+
+	sensor->link_freq_menu = (s64)sensor->cur_mode->link_freq_hz;
+
+	if (sensor->link_freq)
+		*sensor->link_freq->p_new.p_s64 = sensor->link_freq_menu;
+
+	if (sensor->pixel_rate)
+		sensor->pixel_rate->val = (s32)min_t(u64, prate, S32_MAX);
+}
+
 static int openhd_camera_get_fmt(struct v4l2_subdev *sd,
 			struct v4l2_subdev_state *state,
 			struct v4l2_subdev_format *fmt)
 {
-	fmt->format.width = OPENHD_WIDTH;
-	fmt->format.height = OPENHD_HEIGHT;
-	fmt->format.code = MEDIA_BUS_FMT_UYVY8_2X8;  /* Fixed: use 2X8 format */
-	fmt->format.field = V4L2_FIELD_NONE;
-	fmt->format.colorspace = V4L2_COLORSPACE_SRGB;
-	fmt->format.ycbcr_enc = V4L2_YCBCR_ENC_601;
-	fmt->format.quantization = V4L2_QUANTIZATION_FULL_RANGE;
-	fmt->format.xfer_func = V4L2_XFER_FUNC_SRGB;
+	struct openhd_camera_dev *sensor =
+        container_of(sd, struct openhd_camera_dev, sd);
+	fmt->format = sensor->fmt;
 
 	return 0;
 }
@@ -70,32 +138,54 @@ static int openhd_camera_get_fmt(struct v4l2_subdev *sd,
 static int  openhd_camera_g_frame_interval(struct v4l2_subdev *sd,
 				    struct v4l2_subdev_frame_interval *fi)
 {
-    fi->interval.numerator = 10000;
-	fi->interval.denominator = 600000;
+	struct openhd_camera_dev *sensor =
+        container_of(sd, struct openhd_camera_dev, sd);
+    fi->interval.numerator = 1;
+	fi->interval.denominator = sensor->cur_mode->fps;
 
 	return 0;
 }
 
-static int openhd_camera_set_fmt(struct v4l2_subdev *sd,
-			struct v4l2_subdev_state *state,
-			struct v4l2_subdev_format *fmt)
+static const struct runcam_mode *openhd_find_best_mode(const struct runcam_model_info *model,
+                      u32 width, u32 height, u32 code)
 {
-	struct openhd_camera_dev *sensor = container_of(sd, struct openhd_camera_dev, sd);
+	const struct runcam_mode *best = &model->modes[0];
+	unsigned int i;
 
-	/* Force our fixed format */
-	fmt->format.width = OPENHD_WIDTH;
-	fmt->format.height = OPENHD_HEIGHT;
-	fmt->format.code = MEDIA_BUS_FMT_UYVY8_2X8;  /* Fixed: use 2X8 format */
-	fmt->format.field = V4L2_FIELD_NONE;
+	for (i = 0; i < model->num_modes; i++) {
+		const struct runcam_mode *m = &model->modes[i];
+		if (m->width == width && m->height == height)
+			best = m;
+	}
+	return best;
+}
+
+static int openhd_camera_set_fmt(struct v4l2_subdev *sd,
+                                  struct v4l2_subdev_state *state,
+                                  struct v4l2_subdev_format *fmt)
+{
+	struct openhd_camera_dev *sensor =
+		container_of(sd, struct openhd_camera_dev, sd);
+	const struct runcam_mode *mode;
+
+	mode = openhd_find_best_mode(sensor->model, fmt->format.width, fmt->format.height, fmt->format.code);
+	if (!mode)
+		mode = &sensor->model->modes[0];  /* fallback */
+
+	fmt->format.width     = mode->width;
+	fmt->format.height    = mode->height;
+	fmt->format.code      = MEDIA_BUS_FMT_UYVY8_1X16;
+	fmt->format.field     = V4L2_FIELD_NONE;
 	fmt->format.colorspace = V4L2_COLORSPACE_SRGB;
-	fmt->format.ycbcr_enc = V4L2_YCBCR_ENC_601;
-	fmt->format.quantization = V4L2_QUANTIZATION_FULL_RANGE;
-	fmt->format.xfer_func = V4L2_XFER_FUNC_SRGB;
 
 	if (fmt->which == V4L2_SUBDEV_FORMAT_ACTIVE) {
-		mutex_lock(state->lock);
-		sensor->fmt = fmt->format;
-		mutex_unlock(state->lock);
+		if (sensor->streaming)
+			return -EBUSY;
+
+		sensor->cur_mode = mode;
+		sensor->fmt      = fmt->format;
+
+		openhd_update_link_controls(sensor);
 	}
 
 	return 0;
@@ -128,6 +218,7 @@ static int openhd_camera_get_mbus_config(struct v4l2_subdev *sd,
 static int openhd_camera_s_stream(struct v4l2_subdev *sd, int enable)
 {
 	struct openhd_camera_dev *sensor = container_of(sd, struct openhd_camera_dev, sd);
+	struct i2c_client *client = v4l2_get_subdevdata(sd);
 	int ret = 0;
 
 	dev_info(sd->dev, "%s: %s streaming\n", __func__, enable ? "start" : "stop");
@@ -152,6 +243,18 @@ static int openhd_camera_s_stream(struct v4l2_subdev *sd, int enable)
 			gpiod_set_value_cansleep(sensor->reset_gpio, 0);
 			usleep_range(10000, 20000);
 		}
+
+		openhd_camera_write32(client, 0x000008,
+		      sensor->cur_mode->mode_reg);
+
+if (sensor->cur_mode->timing_reg)
+	openhd_camera_write32(client, 0x000034,
+			      sensor->cur_mode->timing_reg);
+
+if (sensor->cur_mode->needs_isp_reset)
+	openhd_camera_write32(client,
+			      0x000694,
+			      0x00000130);
 
 		sensor->streaming = true;
 		dev_info(sd->dev, "OpenHD camera streaming started\n");
@@ -225,10 +328,10 @@ static int openhd_camera_enum_frame_sizes(
 	if (fse->code != MEDIA_BUS_FMT_UYVY8_2X8)
 		return -EINVAL;
 
-	fse->min_width = OPENHD_WIDTH;
-	fse->max_width = OPENHD_WIDTH;
-	fse->min_height = OPENHD_HEIGHT;
-	fse->max_height = OPENHD_HEIGHT;
+	fse->min_width = 100;
+	fse->max_width = 1920;
+	fse->min_height = 100;
+	fse->max_height = 1080;
 
 	return 0;
 }
@@ -339,6 +442,58 @@ static int openhd_get_regulators(struct openhd_camera_dev *sensor)
 	return 0;
 }
 
+static bool openhd_runcam_valid_read(u32 val)
+{
+	return val != 0x00000000 && val != 0xffffffff;
+}
+
+static int openhd_runcam_detect(struct i2c_client *client,
+				struct openhd_camera_dev *sensor)
+{
+	const struct runcam_model_info *model = sensor->model;
+	u32 val;
+	int ret;
+
+	if (!model)
+		return -EINVAL;
+
+	if (client->addr != model->i2c_addr) {
+		dev_err(&client->dev,
+			"DT compatible %s expects i2c addr 0x%02x, got 0x%02x\n",
+			model->name, model->i2c_addr, client->addr);
+		return -ENODEV;
+	}
+
+	if (model->detect_by_write) {
+		ret = openhd_camera_write32(client, model->detect_reg,
+					    model->detect_value);
+		if (ret)
+			return dev_err_probe(&client->dev, ret,
+					     "failed to detect %s by write\n",
+					     model->name);
+
+		return 0;
+	}
+
+	ret = openhd_camera_read32(client, model->detect_reg, &val);
+	if (ret)
+		return dev_err_probe(&client->dev, ret,
+				     "failed to read detect reg for %s\n",
+				     model->name);
+
+	if (!openhd_runcam_valid_read(val)) {
+		dev_err(&client->dev,
+			"invalid detect value for %s: 0x%08x\n",
+			model->name, val);
+		return -ENODEV;
+	}
+
+	dev_dbg(&client->dev, "%s detect reg 0x%x = 0x%08x\n",
+		model->name, model->detect_reg, val);
+
+	return 0;
+}
+
 static int openhd_camera_probe(struct i2c_client *client,
 			 const struct i2c_device_id *id)
 {
@@ -365,22 +520,34 @@ static int openhd_camera_probe(struct i2c_client *client,
 	if (ret)
 		return ret;
 
+	sensor->model = device_get_match_data(&client->dev);
+	if (!sensor->model)
+		return -ENODEV;
+
+	ret = openhd_runcam_detect(client, sensor);
+	if (ret) {
+		dev_err(&client->dev,
+			"failed to detect supported RunCam at i2c addr 0x%02x\n",
+			client->addr);
+		return ret;
+	}
+
+
+	sensor->cur_mode = &sensor->model->modes[0];
+
+	dev_info(&client->dev, "detected RunCam %s at 0x%02x\n",
+		 sensor->model->name, client->addr);
+
 	/* Initialize controls */
+	sensor->link_freq_menu = (s64)sensor->cur_mode->link_freq_hz;
+
 	v4l2_ctrl_handler_init(&sensor->ctrl_handler, 2);
 
-	sensor->link_freq = v4l2_ctrl_new_int_menu(&sensor->ctrl_handler,
-						   NULL,
-						   V4L2_CID_LINK_FREQ,
-						   ARRAY_SIZE(link_freq_menu_items) - 1,
-						   0, link_freq_menu_items);
+	sensor->link_freq = v4l2_ctrl_new_int_menu(&sensor->ctrl_handler, NULL, V4L2_CID_LINK_FREQ, 0, 0, &sensor->link_freq_menu);
 	if (sensor->link_freq)
 		sensor->link_freq->flags |= V4L2_CTRL_FLAG_READ_ONLY;
 
-	sensor->pixel_rate = v4l2_ctrl_new_std(&sensor->ctrl_handler,
-					       NULL,
-					       V4L2_CID_PIXEL_RATE,
-					       0, OPENHD_PIXEL_RATE, 1,
-					       OPENHD_PIXEL_RATE);
+	sensor->pixel_rate = v4l2_ctrl_new_std(&sensor->ctrl_handler, NULL, V4L2_CID_PIXEL_RATE, 0, openhd_pixel_rate(sensor->cur_mode, sensor->csi_lanes), 1, openhd_pixel_rate(sensor->cur_mode, sensor->csi_lanes));
 	if (sensor->pixel_rate)
 		sensor->pixel_rate->flags |= V4L2_CTRL_FLAG_READ_ONLY;
 
@@ -391,8 +558,8 @@ static int openhd_camera_probe(struct i2c_client *client,
 	}
 
 	/* Initialize format */
-	sensor->fmt.width = OPENHD_WIDTH;
-	sensor->fmt.height = OPENHD_HEIGHT;
+	sensor->fmt.width = sensor->cur_mode->width;
+	sensor->fmt.height = sensor->cur_mode->height;
 	sensor->fmt.code = MEDIA_BUS_FMT_UYVY8_2X8;
 	sensor->fmt.field = V4L2_FIELD_NONE;
 	sensor->fmt.colorspace = V4L2_COLORSPACE_SRGB;
@@ -427,8 +594,8 @@ static int openhd_camera_probe(struct i2c_client *client,
 	if (ret)
 		goto err_clean_entity;
 
-	dev_info(&client->dev, "OpenHD camera probe successful: %ux%u, format UYVY, %d CSI lanes\n",
-		 OPENHD_WIDTH, OPENHD_HEIGHT, sensor->csi_lanes);
+	dev_info(&client->dev, "OpenHD RunCam %s camera probe successful: %ux%u, format UYVY, %d CSI lanes\n",
+		 sensor->model->name, sensor->fmt.width, sensor->fmt.height, sensor->csi_lanes);
 
 	return 0;
 
@@ -457,9 +624,13 @@ static const struct i2c_device_id openhd_camera_id[] = {
 MODULE_DEVICE_TABLE(i2c, openhd_camera_id);
 
 static const struct of_device_id openhd_camera_of_match[] = {
-	{ .compatible = "openhd,camera" },
+	{ .compatible = "runcam,micro-v1", .data = &runcam_micro_v1_info },
+	{ .compatible = "runcam,micro-v2", .data = &runcam_micro_v2_info },
+	{ .compatible = "runcam,nano-90",  .data = &runcam_nano90_info  },
+	{ .compatible = "runcam,micro-v3", .data = &runcam_micro_v3_info },
 	{ },
 };
+
 MODULE_DEVICE_TABLE(of, openhd_camera_of_match);
 
 static struct i2c_driver openhd_camera_driver = {
