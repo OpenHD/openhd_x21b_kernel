@@ -142,8 +142,14 @@
 		};
 
 		csi_dphy_input5: endpoint@5 {
-			reg = <4>;
+			reg = <5>;
 			remote-endpoint = <&arducam_out>;
+			data-lanes = <1 2 3 4>;
+		};
+
+		csi_dphy_input6: endpoint@6 {
+			reg = <6>;
+			remote-endpoint = <&runcam_dummy_out>;
 			data-lanes = <1 2 3 4>;
 		};
 	};
@@ -263,6 +269,27 @@
 		port {
 			arducam_out: endpoint {
 				remote-endpoint = <&csi_dphy_input5>;
+				data-lanes = <1 2 3 4>;
+			};
+		};
+	};
+
+	runcam_dummy: runcam-dummy@64 {
+		compatible = "foxeer,digisight-v3";
+		status = "okay";
+		reg = <0x64>;
+		clocks = <&cru CLK_MIPI0_OUT2IO>;
+		clock-names = "xvclk";
+		pinctrl-names = "default";
+		pinctrl-0 = <&cam_clk0_pins>;
+		rockchip,camera-module-index = <0>;
+		rockchip,camera-module-facing = "front";
+		rockchip,camera-module-name = "runcam-dummy";
+		rockchip,camera-module-lens-name = "default";
+
+		port {
+			runcam_dummy_out: endpoint {
+				remote-endpoint = <&csi_dphy_input6>;
 				data-lanes = <1 2 3 4>;
 			};
 		};
@@ -460,5 +487,12 @@
 &uart3 {
 	pinctrl-names = "default";
 	pinctrl-0 = <&uart3m2_xfer_pins>;
+	status = "okay";
+};
+
+// Telemetry UART
+&uart4 {
+	pinctrl-names = "default";
+	pinctrl-0 = <&uart4m1_xfer_pins>;
 	status = "okay";
 };

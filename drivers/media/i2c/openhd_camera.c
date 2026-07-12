@@ -244,17 +244,18 @@ static int openhd_camera_s_stream(struct v4l2_subdev *sd, int enable)
 			usleep_range(10000, 20000);
 		}
 
-		openhd_camera_write32(client, 0x000008,
-		      sensor->cur_mode->mode_reg);
+		if (!sensor->model->skip_detect && sensor->cur_mode->mode_reg)
+			openhd_camera_write32(client, 0x000008,
+				sensor->cur_mode->mode_reg);
 
-if (sensor->cur_mode->timing_reg)
-	openhd_camera_write32(client, 0x000034,
-			      sensor->cur_mode->timing_reg);
+		if (sensor->cur_mode->timing_reg)
+			openhd_camera_write32(client, 0x000034,
+					sensor->cur_mode->timing_reg);
 
-if (sensor->cur_mode->needs_isp_reset)
-	openhd_camera_write32(client,
-			      0x000694,
-			      0x00000130);
+		if (sensor->cur_mode->needs_isp_reset)
+			openhd_camera_write32(client,
+					0x000694,
+					0x00000130);
 
 		sensor->streaming = true;
 		dev_info(sd->dev, "OpenHD camera streaming started\n");
@@ -464,6 +465,13 @@ static int openhd_runcam_detect(struct i2c_client *client,
 		return -ENODEV;
 	}
 
+	if (model->skip_detect) {
+		dev_info(&client->dev,
+			 "skipping register detect for %s\n",
+			 model->name);
+		return 0;
+	}
+
 	if (model->detect_by_write) {
 		ret = openhd_camera_write32(client, model->detect_reg,
 					    model->detect_value);
@@ -535,8 +543,11 @@ static int openhd_camera_probe(struct i2c_client *client,
 
 	sensor->cur_mode = &sensor->model->modes[0];
 
-	dev_info(&client->dev, "detected RunCam %s at 0x%02x\n",
-		 sensor->model->name, client->addr);
+	dev_info(&client->dev,
+	 "detected RunCam %s at 0x%02x, link_freq=%llu Hz\n",
+	 sensor->model->name,
+	 client->addr,
+	 (unsigned long long)sensor->cur_mode->link_freq_hz);
 
 	/* Initialize controls */
 	sensor->link_freq_menu = (s64)sensor->cur_mode->link_freq_hz;
@@ -628,6 +639,7 @@ static const struct of_device_id openhd_camera_of_match[] = {
 	{ .compatible = "runcam,micro-v2", .data = &runcam_micro_v2_info },
 	{ .compatible = "runcam,nano-90",  .data = &runcam_nano90_info  },
 	{ .compatible = "runcam,micro-v3", .data = &runcam_micro_v3_info },
+	{ .compatible = "foxeer,digisight-v3", .data = &foxeer_digisight_v3_info },
 	{ },
 };
 

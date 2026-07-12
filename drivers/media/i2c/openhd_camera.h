@@ -49,6 +49,7 @@ struct runcam_model_info {
 
 	u8 i2c_addr;
 
+	bool skip_detect;
 	u32 detect_reg;
 	bool detect_by_write;
 	u32 detect_value;
@@ -75,6 +76,7 @@ static const struct runcam_model_info runcam_micro_v1_info = {
 	.name = "micro-v1",
 	.i2c_addr = 0x21,
 
+	.skip_detect = false,
 	.detect_reg = 0x50,
 	.detect_by_write = true,
 	.detect_value = 0x0452484E,
@@ -218,6 +220,7 @@ static const struct runcam_model_info runcam_micro_v2_info = {
 	.name = "micro-v2",
 	.i2c_addr = 0x22,
 
+	.skip_detect = false,
 	.detect_reg = 0x50,
 
 	.attrs = {
@@ -357,6 +360,7 @@ static const struct runcam_model_info runcam_nano90_info = {
 	.name = "nano-90",
 	.i2c_addr = 0x23,
 
+	.skip_detect = false,
 	.detect_reg = 0x50,
 
 	.attrs = {
@@ -499,6 +503,7 @@ static const struct runcam_model_info runcam_micro_v3_info = {
 	.name = "micro-v3",
 	.i2c_addr = 0x24,
 
+	.skip_detect = false,
 	.detect_reg = 0x50,
 
 	.attrs = {
@@ -590,6 +595,25 @@ static const struct runcam_model_info runcam_micro_v3_info = {
 
 	.modes = runcam_micro_v3_modes,
 	.num_modes = ARRAY_SIZE(runcam_micro_v3_modes),
+};
+
+static const struct runcam_mode foxeer_digisight_v3_modes[] = {
+	{
+		.name = "720p60",
+		.width = 1280,
+		.height = 720,
+		.fps = 60,
+		.link_freq_hz  = 331776000ULL,
+	},
+};
+
+static const struct runcam_model_info foxeer_digisight_v3_info = {
+	.name = "foxeer-digisight-v3",
+	.i2c_addr = 0x64,
+	.skip_detect = true,
+
+	.modes = foxeer_digisight_v3_modes,
+	.num_modes = ARRAY_SIZE(foxeer_digisight_v3_modes),
 };
 
 #endif
