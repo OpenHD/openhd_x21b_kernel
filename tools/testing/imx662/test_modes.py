@@ -146,6 +146,12 @@ int main(void) {
         struct v4l2_subdev_frame_interval_enum illegal = { .index = 7 };
         assert(imx662_enum_frame_interval(&sd, NULL, &illegal) == -EINVAL);
     }
+    assert(imx662_channel_vc(NO_HDR, 0) == 0);
+    assert(imx662_channel_vc(NO_HDR, 1) == -EINVAL);
+    assert(imx662_channel_vc(HDR_X2, 0) == 0);
+    assert(imx662_channel_vc(HDR_X2, 1) == 1);
+    assert(imx662_channel_vc(HDR_X2, 2) == -EINVAL);
+    assert(imx662_channel_vc(HDR_X2, UINT32_MAX) == -EINVAL);
     struct imx662 sensor = {.mode = &modes_hdr[0], .hdr_enabled = 1, .HMAX = 660, .VMAX = 2500};
     struct v4l2_subdev sd = {.sensor = &sensor};
     struct v4l2_ctrl ctrl = {.sensor = &sensor};

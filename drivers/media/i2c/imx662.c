@@ -428,7 +428,7 @@ static const u32 codes_normal[] = {
 	MEDIA_BUS_FMT_SBGGR12_1X12,
 };
 
-/* Flip isnÃ¢â‚¬â„¢t relevant for mono */
+/* Flip isnÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢t relevant for mono */
 static const u32 mono_codes[] = {
 	MEDIA_BUS_FMT_Y12_1X12,   /* 12-bit mono */
 };
@@ -809,6 +809,14 @@ struct imx662_hdr_regs {
 	u32 shr0, shr1, long_gain, short_gain;
 };
 
+static int imx662_channel_vc(u8 hdr_mode, u32 index)
+{
+	/* X21 CIF asks by stream ID, with HDR2 long/short on VC0/VC1. */
+	if (index >= (hdr_mode ? 2 : 1))
+		return -EINVAL;
+	return index;
+}
+
 static struct imx662_hdr_regs imx662_calc_hdrae(u32 fsc,
 				const struct preisp_hdrae_exp_s *ae)
 {
@@ -1139,7 +1147,7 @@ static void imx662_update_image_pad_format(struct imx662 *imx662,
 	fmt->format.width = mode->width;
 	fmt->format.height = mode->height;
 	fmt->format.field = V4L2_FIELD_NONE;
-	fmt->reserved[0] = mode->hdr_mode ? 1 : 0;
+	fmt->reserved[0] = 0; /* X21 CIF stream0 is long VC0. */
 	imx662_reset_colorspace(mode, &fmt->format);
 }
 
@@ -1641,10 +1649,10 @@ static long imx662_ioctl(struct v4l2_subdev *sd, unsigned int cmd, void *arg)
 	}
 	case RKMODULE_GET_CHANNEL_INFO: {
 		struct rkmodule_channel_info *ch = arg;
-		if (ch->index >= (imx662->mode->hdr_mode ? 4 : 1))
-			return -EINVAL;
-		/* Rockchip PAD1 selects long VC0; PAD0/2/3 select short VC1. */
-		ch->vc = imx662->mode->hdr_mode && ch->index != 1 ? 1 : 0;
+		int vc = imx662_channel_vc(imx662->mode->hdr_mode, ch->index);
+		if (vc < 0)
+			return vc;
+		ch->vc = vc;
 		ch->width = imx662->mode->width;
 		ch->height = imx662->mode->height;
 		mutex_lock(&imx662->mutex);
@@ -2049,7 +2057,7 @@ static int imx662_probe(struct i2c_client *client, const struct i2c_device_id *i
 		return -EINVAL;
 	}
 
-	dev_dbg(dev, "XCLK %u Hz Ã¢â€ â€™ INCK_SEL 0x%02x\n",
+	dev_dbg(dev, "XCLK %u Hz ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ INCK_SEL 0x%02x\n",
 		 imx662->xclk_freq, imx662->inck_sel_val);
 
 	ret = imx662_get_regulators(imx662);
