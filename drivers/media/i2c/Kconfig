@@ -2388,7 +2388,7 @@ config VIDEO_DW9800V
 	select V4L2_FWNODE
 	help
 	  This is a driver for the DW9800V camera lens voice coil.
-	  DW9800W is a 10 bit DAC with ±130mA output current sink
+	  DW9800W is a 10 bit DAC with Â±130mA output current sink
 	  capability. This is designed for linear control of bi-direction
 	  voice coil motors, controlled via I2C serial interface.
 
@@ -2400,7 +2400,7 @@ config VIDEO_DW9800W
 	select V4L2_FWNODE
 	help
 	  This is a driver for the DW9800W camera lens voice coil.
-	  DW9800W is a 10 bit DAC with ±100mA output current sink
+	  DW9800W is a 10 bit DAC with Â±100mA output current sink
 	  capability. This is designed for linear control of
 	  voice coil motors, controlled via I2C serial interface.
 
@@ -3479,3 +3479,11 @@ config VIDEO_THS7303
 endmenu
 
 endif # VIDEO_DEV
+
+config VIDEO_IMX662
+	tristate "Sony IMX662 sensor support"
+	depends on I2C && VIDEO_DEV
+	select V4L2_FWNODE
+	help
+	  Support for the Sony IMX662 RAW10/RAW12 camera sensor,
+	  including full-frame 90 fps and two-exposure DOL HDR.
