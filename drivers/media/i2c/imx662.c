@@ -428,7 +428,7 @@ static const u32 codes_normal[] = {
 	MEDIA_BUS_FMT_SBGGR12_1X12,
 };
 
-/* Flip isnÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢t relevant for mono */
+/* Flip isnÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢t relevant for mono */
 static const u32 mono_codes[] = {
 	MEDIA_BUS_FMT_Y12_1X12,   /* 12-bit mono */
 };
@@ -1575,6 +1575,9 @@ static int imx662_get_selection(struct v4l2_subdev *sd,
 				struct v4l2_subdev_state *sd_state,
 				struct v4l2_subdev_selection *sel)
 {
+	if (sel->pad != IMAGE_PAD ||
+	    (sel->which != V4L2_SUBDEV_FORMAT_TRY && sel->which != V4L2_SUBDEV_FORMAT_ACTIVE))
+		return -EINVAL;
 	switch (sel->target) {
 	case V4L2_SEL_TGT_CROP: {
 		struct imx662 *imx662 = to_imx662(sd);
@@ -1587,6 +1590,7 @@ static int imx662_get_selection(struct v4l2_subdev *sd,
 	}
 
 	case V4L2_SEL_TGT_NATIVE_SIZE:
+	case V4L2_SEL_TGT_CROP_BOUNDS:
 		sel->r.left = 0;
 		sel->r.top = 0;
 		sel->r.width = IMX662_NATIVE_WIDTH;
@@ -1594,7 +1598,6 @@ static int imx662_get_selection(struct v4l2_subdev *sd,
 		return 0;
 
 	case V4L2_SEL_TGT_CROP_DEFAULT:
-	case V4L2_SEL_TGT_CROP_BOUNDS:
 		sel->r.left = IMX662_PIXEL_ARRAY_LEFT;
 		sel->r.top = IMX662_PIXEL_ARRAY_TOP;
 		sel->r.width = IMX662_PIXEL_ARRAY_WIDTH;
@@ -2057,7 +2060,7 @@ static int imx662_probe(struct i2c_client *client, const struct i2c_device_id *i
 		return -EINVAL;
 	}
 
-	dev_dbg(dev, "XCLK %u Hz ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ INCK_SEL 0x%02x\n",
+	dev_dbg(dev, "XCLK %u Hz ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ INCK_SEL 0x%02x\n",
 		 imx662->xclk_freq, imx662->inck_sel_val);
 
 	ret = imx662_get_regulators(imx662);
