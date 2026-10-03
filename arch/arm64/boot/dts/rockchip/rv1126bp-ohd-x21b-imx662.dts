@@ -1,0 +1,59 @@
+// SPDX-License-Identifier: (GPL-2.0+ OR MIT)
+#include "rv1126bp-ohd-x21b.dts"
+
+/ {
+	model = "OpenHD X21B IMX662";
+
+	/* The camera module supplies its own 24 MHz crystal. */
+	imx662_osc: imx662-osc {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <24000000>;
+	};
+};
+
+&i2c5 {
+	/delete-node/ runcam-micro-v1@21;
+	/delete-node/ runcam-micro-v2@22;
+	/delete-node/ runcam-nano-90@23;
+	/delete-node/ runcam-micro-v3@24;
+	/delete-node/ arducam-pivariety@c;
+	/delete-node/ runcam-dummy@64;
+
+	imx662: camera@1a {
+		compatible = "sony,imx662";
+		reg = <0x1a>;
+		clocks = <&imx662_osc>;
+		clock-names = "xvclk";
+		/* No reset GPIO is assigned until the module pinout is verified. */
+		rockchip,camera-module-index = <0>;
+		rockchip,camera-module-facing = "front";
+		rockchip,camera-module-name = "CMK-OT1234-FV0";
+		rockchip,camera-module-lens-name = "M00-2MP-F00";
+		port {
+			imx662_out: endpoint {
+				remote-endpoint = <&imx662_dphy_in>;
+				data-lanes = <1 2 3 4>;
+				link-frequencies = /bits/ 64 <297000000 360000000>;
+			};
+		};
+	};
+};
+
+&csi2_dphy0 {
+	#address-cells = <1>;
+	#size-cells = <0>;
+	port@0 {
+		/delete-node/ endpoint@1;
+		/delete-node/ endpoint@2;
+		/delete-node/ endpoint@3;
+		/delete-node/ endpoint@4;
+		/delete-node/ endpoint@5;
+		/delete-node/ endpoint@6;
+		imx662_dphy_in: endpoint@7 {
+			reg = <7>;
+			remote-endpoint = <&imx662_out>;
+			data-lanes = <1 2 3 4>;
+		};
+	};
+};
