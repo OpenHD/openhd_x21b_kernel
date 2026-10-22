@@ -79,8 +79,8 @@ config VIDEO_AR0521
 	  To compile this driver as a module, choose M here: the
 	  module will be called ar0521.
 
-config VIDEO_AR0822
-	tristate "Onsemi AR0822 sensor support"
+config VIDEO_ARDUCAM_OPENHD
+	tristate "Onsemi ARDUCAM_OPENHD sensor support"
 	depends on I2C && VIDEO_DEV
 	depends on MEDIA_CAMERA_SUPPORT
 	select MEDIA_CONTROLLER
@@ -88,10 +88,10 @@ config VIDEO_AR0822
 	select V4L2_FWNODE
 	help
 	  This is a Video4Linux2 sensor driver for the Onsemi
-	  AR0822 camera.
+	  ARDUCAM_OPENHD camera.
 
 	  To compile this driver as a module, choose M here: the
-	  module will be called ar0822.
+	  module will be called arducam_openhd.
 
 config VIDEO_AR2020
 	tristate "Onsemi AR2020 sensor support"
@@ -114,6 +114,7 @@ config VIDEO_ARDUCAM
     select VIDEO_V4L2_SUBDEV_API
     select V4L2_FWNODE
     select V4L2_CTRL
+    select CRC32
     help
       This is a V4L2 sensor driver for OpenHD cameras.
 
@@ -3487,3 +3488,11 @@ config VIDEO_IMX662
 	help
 	  Support for the Sony IMX662 RAW10/RAW12 camera sensor,
 	  including full-frame 90 fps and two-exposure DOL HDR.
+
+config ARDUCAM_OPENHD_EMBEDDED_FW
+    bool "Embed board-provided arducam_openhd provisioning data"
+    depends on VIDEO_ARDUCAM
+    default n
+    help
+      Product builds supply the qualified payload through their private build
+      integration. The public driver does not distribute a camera payload.

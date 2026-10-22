@@ -6637,7 +6637,7 @@ static int rkcif_create_dummy_buf(struct rkcif_stream *stream)
 	struct rkcif_hw *hw = dev->hw_dev;
 	struct rkcif_dummy_buffer *dummy_buf = &hw->dummy_buf;
 	struct rkcif_device *tmp_dev = NULL;
-	struct v4l2_subdev_frame_interval_enum fie;
+	struct v4l2_subdev_frame_size_enum fse;
 	struct v4l2_subdev_format fmt;
 	u32 max_size = 0;
 	u32 size = 0;
@@ -6654,44 +6654,43 @@ static int rkcif_create_dummy_buf(struct rkcif_stream *stream)
 		}
 
 		if (tmp_dev->terminal_sensor.sd) {
+			/* Frame-interval enumeration requires a code and dimensions as
+			 * inputs; it cannot discover the sensor's largest frame. In
+			 * particular, Pivariety rejects the old all-zero interval query,
+			 * leaving a 720p allocation behind after failed stream-on.
+			 */
+			memset(&fmt, 0, sizeof(fmt));
+			fmt.which = V4L2_SUBDEV_FORMAT_ACTIVE;
+			ret = v4l2_subdev_call(tmp_dev->terminal_sensor.sd,
+					       pad, get_fmt, NULL, &fmt);
+			if (ret)
+				continue;
 			for (j = 0; j < 32; j++) {
-				memset(&fie, 0, sizeof(fie));
-				fie.index = j;
-				fie.pad = 0;
-				fie.which = V4L2_SUBDEV_FORMAT_ACTIVE;
-
+				memset(&fse, 0, sizeof(fse));
+				fse.index = j;
+				fse.code = fmt.format.code;
+				fse.which = V4L2_SUBDEV_FORMAT_ACTIVE;
 				ret = v4l2_subdev_call(tmp_dev->terminal_sensor.sd,
-						       pad, enum_frame_interval,
-						       NULL, &fie);
-				if (!ret) {
-					if (fie.code == MEDIA_BUS_FMT_RGB888_1X24 ||
-					    fie.code == MEDIA_BUS_FMT_BGR888_1X24 ||
-					    fie.code == MEDIA_BUS_FMT_GBR888_1X24)
-						size = fie.width * fie.height * 3;
-					else
-						size = fie.width * fie.height * 2;
-
-					v4l2_info(&dev->v4l2_dev,
-						  "%s: dev[%d] sensor=%s enum_frame_interval[%d]: "
-						  "code=0x%x %ux%u interval=%u/%u calc_size=%u\n",
-						  __func__, i,
-						  tmp_dev->terminal_sensor.sd->name,
-						  j, fie.code, fie.width, fie.height,
-						  fie.interval.numerator,
-						  fie.interval.denominator,
-						  size);
-				} else {
-					v4l2_dbg(1, rkcif_debug, &dev->v4l2_dev,
-						 "%s: dev[%d] sensor=%s enum_frame_interval[%d] ret=%d\n",
-						 __func__, i,
-						 tmp_dev->terminal_sensor.sd->name,
-						 j, ret);
+						       pad, enum_frame_size,
+						       NULL, &fse);
+				if (ret)
 					break;
-				}
-
-				if (size > max_size)
-					max_size = size;
+				if (fse.code == MEDIA_BUS_FMT_RGB888_1X24 ||
+				    fse.code == MEDIA_BUS_FMT_BGR888_1X24 ||
+				    fse.code == MEDIA_BUS_FMT_GBR888_1X24)
+					size = fse.max_width * fse.max_height * 3;
+				else
+					size = fse.max_width * fse.max_height * 2;
+				max_size = max(max_size, size);
 			}
+			/* Drivers without enum_frame_size still have an active format. */
+			if (fmt.format.code == MEDIA_BUS_FMT_RGB888_1X24 ||
+			    fmt.format.code == MEDIA_BUS_FMT_BGR888_1X24 ||
+			    fmt.format.code == MEDIA_BUS_FMT_GBR888_1X24)
+				size = fmt.format.width * fmt.format.height * 3;
+			else
+				size = fmt.format.width * fmt.format.height * 2;
+			max_size = max(max_size, size);
 		}
 	}
 
@@ -6725,6 +6724,23 @@ static int rkcif_create_dummy_buf(struct rkcif_stream *stream)
 
 	v4l2_info(&dev->v4l2_dev,
 		  "%s: final max_size=%u\n", __func__, max_size);
+
+	if (!max_size)
+		return -EINVAL;
+	if (dummy_buf->vaddr) {
+		if (dummy_buf->size >= max_size)
+			return 0;
+		/* The buffer is shared by all CIF streams. Never replace memory
+		 * that another stream can still address from an interrupt.
+		 */
+		for (i = 0; i < hw->dev_num; i++)
+			if (hw->cif_dev[i] &&
+			    atomic_read(&hw->cif_dev[i]->pipe.stream_cnt))
+				return -EBUSY;
+		rkcif_free_buffer(dev, dummy_buf);
+		dummy_buf->dma_addr = 0;
+		dummy_buf->vaddr = NULL;
+	}
 
 	dummy_buf->size = max_size;
 	dummy_buf->is_need_vaddr = true;
@@ -8813,7 +8829,6 @@ int rkcif_do_start_stream(struct rkcif_stream *stream, enum rkcif_stream_mode mo
 
 	if (((dev->active_sensor && dev->active_sensor->mbus.type == V4L2_MBUS_BT656) ||
 	     dev->is_use_dummybuf) &&
-	    (!dev->hw_dev->dummy_buf.vaddr) &&
 	    mode == RKCIF_STREAM_MODE_CAPTURE) {
 		ret = rkcif_create_dummy_buf(stream);
 		if (ret < 0) {

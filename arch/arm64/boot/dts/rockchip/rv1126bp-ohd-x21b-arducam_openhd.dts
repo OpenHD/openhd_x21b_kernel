@@ -1,0 +1,8 @@
+// SPDX-License-Identifier: (GPL-2.0+ OR MIT)
+/* Explicit custom ARDUCAM_OPENHD/ISP/GD32 module profile; permits MCU updates. */
+#include "rv1126bp-ohd-x21b.dts"
+
+&arducam_pivariety {
+	compatible = "openhd,x21-arducam_openhd", "arducam,arducam-pivariety";
+	rockchip,camera-module-name = "arducam-arducam_openhd-arducam_isp";
+};

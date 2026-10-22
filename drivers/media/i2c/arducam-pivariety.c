@@ -14,6 +14,7 @@
  */
 
 #define RADXA
+ #include <linux/crc32.h>
  #include <linux/clk.h>
  #include <linux/delay.h>
  #include <linux/gpio/consumer.h>
@@ -21,6 +22,7 @@
  #include <linux/module.h>
  #include <linux/pm_runtime.h>
  #include <linux/regulator/consumer.h>
+ #include <linux/workqueue.h>
  #include <media/v4l2-ctrls.h>
  #include <media/v4l2-device.h>
  #include <media/v4l2-event.h>
@@ -34,9 +36,26 @@
 #endif
 
  #include "arducam-pivariety.h"
+ #include "arducam-x21-fw.h"
+ #if IS_ENABLED(CONFIG_ARDUCAM_OPENHD_EMBEDDED_FW)
+ #include "arducam-x21-fw-data.h"
+ #endif
+ #include "arducam-x21-timing.h"
+ #include "arducam-x21-hdr.h"
+ #include "arducam-x21-isp.h"
  
  static int debug;
  module_param(debug, int, 0644);
+
+ static bool x21_auto_firmware = true;
+ module_param(x21_auto_firmware, bool, 0444);
+ MODULE_PARM_DESC(x21_auto_firmware,
+     "Update the MCU only on the explicitly selected X21 ARDUCAM_OPENHD board profile");
+
+ static bool x21_linear_720p120 = true;
+ module_param(x21_linear_720p120, bool, 0444);
+ MODULE_PARM_DESC(x21_linear_720p120,
+     "Apply the X21 four-lane 720p120 linear timing after preview settles");
  
  /* regulator supplies */
  static const char * const pivariety_supply_name[] = {
@@ -98,6 +117,13 @@
      int lanes;
      int bayer_order_volatile;
      bool wait_until_free;
+     bool arducam_isp;
+     bool x21_arducam_openhd;
+     bool x21_fast_timing_active;
+     struct v4l2_ctrl *x21_hdr;
+     struct v4l2_ctrl *x21_iq[X21_ISP_COUNT];
+     struct x21_ae_scene_state x21_ae_scene;
+     struct delayed_work x21_timing_work;
  
      struct v4l2_ctrl_handler ctrl_handler;
      struct v4l2_ctrl *ctrls[MAX_CTRLS];
@@ -221,8 +247,14 @@ static struct rkmodule_csi_dphy_param dcphy_param = {
  
      while (count++ < I2C_WRITE_RETRY_COUNT) {
          ret = pivariety_write_reg(client, addr, value);
-         if (!ret)
+         if (!ret) {
+             /* This MCU ACKs queued mode/control commands before its main
+              * loop consumes them. Back-to-back index writes can overwrite
+              * that slot, leaving a 1080p ISP behind a cached 720p format. */
+             if (pivariety->x21_arducam_openhd && pivariety->arducam_isp && addr < 0x0500)
+                 msleep(20);
              return ret;
+         }
      }
  
      v4l2_err(sd, "%s: Write 0x%04x to register 0x%02x failed\n",
@@ -231,23 +263,133 @@ static struct rkmodule_csi_dphy_param dcphy_param = {
      return ret;
  }
  
- static int wait_for_free(struct pivariety *pivariety, int interval)
+ static int wait_for_free_timeout(struct pivariety *pivariety, int interval,
+                                  unsigned int timeout_ms)
  {
      u32 value;
      u32 count = 0;
  
-     while (count++ < (1000 / interval)) {
+     while (count++ < (timeout_ms / interval)) {
          int ret = pivariety_read(pivariety, SYSTEM_IDLE_REG, &value);
  
-         if (!ret && !value)
-             break;
+         if (ret)
+             return ret;
+         if (!value)
+             return 0;
          msleep(interval);
      }
  
      v4l2_dbg(2, debug, &pivariety->sd, "%s: End wait, Count: %d.\n",
           __func__, count);
  
-     return 0;
+     return -ETIMEDOUT;
+ }
+
+ static int wait_for_free(struct pivariety *pivariety, int interval)
+ {
+     return wait_for_free_timeout(pivariety, interval, 1000);
+ }
+
+ static int pivariety_fw_read(void *context, unsigned short reg,
+                              unsigned int *value)
+ {
+     struct pivariety *pivariety = context;
+     struct i2c_client *client = v4l2_get_subdevdata(&pivariety->sd);
+
+     return pivariety_read_reg(client, reg, value);
+ }
+
+ static int pivariety_fw_write(void *context, unsigned short reg,
+                               unsigned int value)
+ {
+     struct pivariety *pivariety = context;
+     struct i2c_client *client = v4l2_get_subdevdata(&pivariety->sd);
+
+     return pivariety_write_reg(client, reg, value);
+ }
+
+ static int pivariety_fw_block(void *context, const unsigned char *data,
+                               unsigned int size)
+ {
+     struct pivariety *pivariety = context;
+     struct i2c_client *client = v4l2_get_subdevdata(&pivariety->sd);
+     int ret = i2c_master_send(client, (const char *)data, size);
+
+     return ret == size ? 0 : ret < 0 ? ret : -EIO;
+ }
+
+ static void pivariety_fw_delay(void *context, unsigned int milliseconds)
+ {
+     if (milliseconds <= 30)
+         usleep_range(milliseconds * 1000, milliseconds * 1000 + 500);
+     else
+         msleep(milliseconds);
+ }
+
+ static void pivariety_fw_progress(void *context, const char *step)
+ {
+     struct pivariety *pivariety = context;
+     struct i2c_client *client = v4l2_get_subdevdata(&pivariety->sd);
+
+     dev_info(&client->dev, "MCU firmware: %s\n", step);
+ }
+
+ static unsigned int pivariety_fw_crc(const unsigned char *data,
+                                      unsigned int size)
+ {
+     return crc32_le(~0U, data, size) ^ ~0U;
+ }
+
+ static int pivariety_ensure_x21_firmware(struct pivariety *pivariety)
+ {
+     struct i2c_client *client = v4l2_get_subdevdata(&pivariety->sd);
+     const struct x21_fw_ops ops = {
+         .context = pivariety,
+         .read = pivariety_fw_read,
+         .write = pivariety_fw_write,
+         .block = pivariety_fw_block,
+         .delay = pivariety_fw_delay,
+         .crc = pivariety_fw_crc,
+         .progress = pivariety_fw_progress,
+     };
+     const struct i2c_adapter_quirks *quirks = client->adapter->quirks;
+     int ret;
+
+     if (!pivariety->x21_arducam_openhd || !x21_auto_firmware)
+         return 0;
+     if (!pivariety->arducam_isp || client->addr != 0x0c ||
+         pivariety->bus.num_data_lanes != 4 ||
+         !i2c_check_functionality(client->adapter, I2C_FUNC_I2C) ||
+         (quirks && quirks->max_write_len && quirks->max_write_len < 66))
+         return -ENODEV;
+
+     dev_info(&client->dev, "Checking X21 ARDUCAM_OPENHD MCU firmware (manual AE, target 600)\n");
+#if IS_ENABLED(CONFIG_ARDUCAM_OPENHD_EMBEDDED_FW)
+     ret = x21_fw_ensure(&ops, x21_arducam_firmware, X21_FW_SIZE,
+                         X21_FW_CRC32, 1);
+#else
+     /* Public builds can use a preprovisioned camera without a private payload. */
+     ret = x21_fw_marker(&ops);
+     ret = ret == 1 ? 0 : (ret ? ret : -ENODATA);
+#endif
+     if (ret < 0)
+         dev_err(&client->dev,
+                 "MCU firmware check/update failed (%d); camera not registered\n", ret);
+     else
+         dev_info(&client->dev, "X21 ARDUCAM_OPENHD firmware %s, revision 0x%04x\n",
+                  ret ? "updated" : "already current", X21_FW_REV);
+     return ret < 0 ? ret : 0;
+ }
+
+ static unsigned int pivariety_arducam_isp_max_fps(struct pivariety *pivariety)
+ {
+     struct arducam_resolution *resolution;
+
+     resolution = &pivariety->supported_formats[pivariety->current_format_idx]
+                      .resolution_set[pivariety->current_resolution_idx];
+     if (pivariety->x21_hdr && pivariety->x21_hdr->val)
+         return 30;
+     return resolution->width == 1280 && resolution->height == 720 ? 120 : 60;
  }
  
  static int is_raw(int pixformat)
@@ -437,6 +579,340 @@ static struct rkmodule_csi_dphy_param dcphy_param = {
      return 0;
  }
  
+ static int pivariety_isp_read(void *context, unsigned short reg,
+                               unsigned int *value)
+ {
+     struct pivariety *pivariety = context;
+     u32 response;
+     unsigned int attempt;
+     int ret = wait_for_free(pivariety, 5);
+
+     if (ret)
+         return ret;
+     ret = pivariety_write(pivariety, 0x0501, (u32)reg << 16);
+     if (ret)
+         return ret;
+     /* Revision 0102 includes queued requests in SYSTEM_IDLE_REG. */
+     usleep_range(5000, 6000);
+     ret = wait_for_free(pivariety, 5);
+     if (ret)
+         return ret;
+     for (attempt = 0; attempt < 10; attempt++) {
+         ret = pivariety_read(pivariety, 0x0501, &response);
+         if (ret)
+             return ret;
+         if ((response >> 16) == reg) {
+             *value = response & 0xffff;
+             return 0;
+         }
+         usleep_range(5000, 6000);
+     }
+     return -EPROTO;
+ }
+
+ static int pivariety_isp_write(void *context, unsigned short reg,
+                                unsigned int value)
+ {
+     struct pivariety *pivariety = context;
+     int ret = wait_for_free(pivariety, 5);
+
+     if (ret)
+         return ret;
+     ret = pivariety_write(pivariety, 0x0502, ((u32)reg << 16) | value);
+     if (ret)
+         return ret;
+     usleep_range(5000, 6000);
+     return wait_for_free(pivariety, 5);
+ }
+
+ /* Standard V4L2 controls belong to the ISP subdevice. No private IQ ABI. */
+ static const u32 x21_iq_ids[X21_ISP_COUNT] = {
+     V4L2_CID_EXPOSURE_ABSOLUTE, V4L2_CID_GAIN,
+     V4L2_CID_AUTO_WHITE_BALANCE, V4L2_CID_WHITE_BALANCE_TEMPERATURE,
+     V4L2_CID_BRIGHTNESS, V4L2_CID_CONTRAST, V4L2_CID_SATURATION,
+     V4L2_CID_GAMMA, V4L2_CID_EXPOSURE_AUTO,
+     V4L2_CID_SCENE_MODE, V4L2_CID_AUTO_EXPOSURE_BIAS,
+ };
+ static int pivariety_x21_iq_index(u32 id)
+ {
+     unsigned int i;
+     for (i = 0; i < ARRAY_SIZE(x21_iq_ids); i++)
+         if (x21_iq_ids[i] == id) return i;
+     return -1;
+ }
+ static struct v4l2_ctrl *get_control(struct pivariety *pivariety, u32 id);
+ static int pivariety_x21_auto_fps(struct pivariety *pivariety, unsigned int fps)
+ {
+     unsigned int flicker;
+     int ret;
+     if (fps > 60) {
+         ret = pivariety_isp_read(pivariety, 0x5440, &flicker);
+         if (ret) return ret;
+         /* Flicker quantization/FRC must not lower a requested high rate. */
+         ret = pivariety_isp_write(pivariety, 0x5440, flicker & ~7U);
+         if (ret) return ret;
+     }
+     return pivariety_isp_write(pivariety, 0x2020, fps << 8);
+ }
+ static int pivariety_x21_apply_iq(struct pivariety *pivariety,
+                                  unsigned int index, int value)
+ {
+     const struct x21_timing_ops ops = {
+         .context = pivariety, .read = pivariety_isp_read,
+         .write = pivariety_isp_write, .delay = pivariety_fw_delay,
+     };
+     if (!pivariety->streaming) return 0;
+     if (index == X21_AE_SCENE) {
+         struct v4l2_ctrl *rate = get_control(pivariety, V4L2_CID_ARDUCAM_FRAME_RATE);
+         int ret;
+         if (pivariety->x21_iq[X21_AE_AUTO]->val != V4L2_EXPOSURE_AUTO) return 0;
+         ret = __v4l2_ctrl_s_ctrl(pivariety->x21_iq[X21_AE_BIAS], 8);
+         if (ret) return ret;
+         return rate ? x21_ae_scene_apply(&ops, &pivariety->x21_ae_scene,
+                                         value, rate->val) : -EINVAL;
+     }
+     /* V4L2 exposure_absolute is in 100 us units. ISP takes us. */
+     if (index == X21_EXPOSURE_US) value *= 100;
+     if ((index == X21_EXPOSURE_US || index == X21_GAIN) &&
+         pivariety->x21_iq[X21_AE_AUTO]->val == V4L2_EXPOSURE_AUTO)
+         return 0;
+     if (index == X21_EXPOSURE_US)
+         return x21_sensor_manual_exposure(&ops, value,
+             pivariety->x21_hdr && pivariety->x21_hdr->val &&
+             pivariety->x21_fast_timing_active);
+     if (index == X21_GAIN)
+         return x21_sensor_manual_gain(&ops, value);
+     if (index == X21_AE_AUTO) {
+         int ret = x21_isp_apply(&ops, index, value == V4L2_EXPOSURE_AUTO);
+         if (ret) return ret;
+         if (value == V4L2_EXPOSURE_AUTO) {
+             struct v4l2_ctrl *rate = get_control(pivariety, V4L2_CID_ARDUCAM_FRAME_RATE);
+             /* Native AE manages sensor blanking at the requested rate. Do
+              * not let the manual delayed table turn it back off. */
+             cancel_delayed_work(&pivariety->x21_timing_work);
+             pivariety->x21_fast_timing_active = false;
+             ret = rate ? pivariety_x21_auto_fps(pivariety, rate->val) : -EINVAL;
+             if (ret) return ret;
+             return pivariety_x21_apply_iq(pivariety, X21_AE_SCENE,
+                         pivariety->x21_iq[X21_AE_SCENE]->val);
+         }
+         if (value == V4L2_EXPOSURE_MANUAL) {
+             ret = pivariety_x21_apply_iq(pivariety, X21_EXPOSURE_US,
+                         pivariety->x21_iq[X21_EXPOSURE_US]->val);
+             if (ret) return ret;
+             ret = pivariety_x21_apply_iq(pivariety, X21_GAIN,
+                         pivariety->x21_iq[X21_GAIN]->val);
+             if (ret) return ret;
+             if (x21_linear_720p120 && !pivariety->x21_fast_timing_active) {
+                 struct v4l2_ctrl *rate = get_control(pivariety, V4L2_CID_ARDUCAM_FRAME_RATE);
+                 if (rate && rate->val == 120)
+                     mod_delayed_work(system_wq, &pivariety->x21_timing_work, 0);
+             }
+         }
+         return 0;
+     }
+     /* Kelvin is retained while AWB is on, and applied when manual is selected. */
+     if (index == X21_WB_K && pivariety->x21_iq[X21_WB_AUTO]->val) return 0;
+     if (index == X21_WB_AUTO && !value) {
+         int ret = x21_isp_apply(&ops, X21_WB_K, pivariety->x21_iq[X21_WB_K]->val);
+         if (ret) return ret;
+     }
+     return x21_isp_apply(&ops, index, value);
+ }
+ static int pivariety_x21_restore_iq(struct pivariety *pivariety)
+ {
+     struct i2c_client *client = v4l2_get_subdevdata(&pivariety->sd);
+     unsigned int i, attempt;
+     int ret;
+     if (!pivariety->x21_iq[0]) return 0;
+     for (i = 0; i < X21_ISP_COUNT; i++) {
+         for (attempt = 0; attempt < 10; attempt++) {
+             ret = pivariety_x21_apply_iq(pivariety, i, pivariety->x21_iq[i]->val);
+             if (ret != -EIO && ret != -EAGAIN) break;
+             /* Sensor writes latch at frame boundaries. A just-completed
+              * readout transition can still expose the previous value, and
+              * MCU geometry readiness can precede sensor PLL readiness.
+              * Retry only these transient states; never an unknown PLL. */
+             if (attempt == 9) break;
+             usleep_range(100000, 105000);
+         }
+         if (ret) {
+             dev_err(&client->dev, "ISP control 0x%x restore failed: %d\n",
+                     x21_iq_ids[i], ret);
+             return ret;
+         }
+     }
+     return 0;
+ }
+
+ static int pivariety_x21_720p120(struct pivariety *pivariety)
+ {
+     struct i2c_client *client = v4l2_get_subdevdata(&pivariety->sd);
+     const struct x21_timing_ops timing = {
+         .context = pivariety,
+         .read = pivariety_isp_read,
+         .write = pivariety_isp_write,
+         .delay = pivariety_fw_delay,
+     };
+     const struct x21_fw_ops firmware = {
+         .context = pivariety,
+         .read = pivariety_fw_read,
+         .write = pivariety_fw_write,
+         .delay = pivariety_fw_delay,
+     };
+     int ret = x21_fw_marker(&firmware);
+
+     if (ret != 1)
+         return ret < 0 ? ret : -EOPNOTSUPP;
+     /* Start from a settled preview, then acquire linear readout before the
+      * final blanking adjustment. All commands hold the V4L2 driver mutex. */
+     ret = pivariety_isp_write(pivariety, 0x2020, 60 << 8);
+     if (ret)
+         return ret;
+     msleep(100);
+     ret = x21_timing_720p120(&timing);
+     if (ret) {
+         dev_err(&client->dev, "720p120 sensor timing failed: %d\n", ret);
+         return ret;
+     }
+     /* The vendor AE immediate request precedes our custom timing. Give its
+      * asynchronous completion time to settle before restoring manual IQ. */
+     msleep(1000);
+     pivariety->x21_fast_timing_active = true;
+     ret = pivariety_x21_restore_iq(pivariety);
+     if (ret) {
+         pivariety->x21_fast_timing_active = false;
+         return ret;
+     }
+     dev_info(&client->dev,
+              "720p120 linear timing: frame=1164 line=1180 exposure=4000us\n");
+     return 0;
+ }
+
+ static int pivariety_x21_hdr30(struct pivariety *pivariety)
+ {
+     struct i2c_client *client = v4l2_get_subdevdata(&pivariety->sd);
+     const struct x21_timing_ops timing = {
+         .context = pivariety, .read = pivariety_isp_read,
+         .write = pivariety_isp_write, .delay = pivariety_fw_delay,
+     };
+     const struct x21_fw_ops firmware = {
+         .context = pivariety, .read = pivariety_fw_read,
+         .write = pivariety_fw_write, .delay = pivariety_fw_delay,
+     };
+     int ret = x21_fw_marker(&firmware);
+
+     if (ret != 1)
+         return ret < 0 ? ret : -EOPNOTSUPP;
+     ret = x21_timing_hdr30(&timing);
+     if (ret)
+         dev_err(&client->dev, "3-exposure HDR timing failed: %d\n", ret);
+     else {
+         pivariety->x21_fast_timing_active = true;
+         ret = pivariety_x21_restore_iq(pivariety);
+         if (ret) {
+             pivariety->x21_fast_timing_active = false;
+             return ret;
+         }
+         dev_info(&client->dev,
+                  "3-exposure HDR: full-field binned input, RAW20 to RAW12, 30 fps\n");
+     }
+     return ret;
+ }
+
+ static int pivariety_x21_restore_geometry(struct pivariety *pivariety)
+ {
+     struct arducam_resolution *resolution =
+         &pivariety->supported_formats[pivariety->current_format_idx]
+              .resolution_set[pivariety->current_resolution_idx];
+     unsigned int width, height, attempt;
+     int ret;
+
+     if (!pivariety->x21_arducam_openhd || !pivariety->arducam_isp)
+         return 0;
+     /* MCU completion precedes the ISP's asynchronous mode application.
+      * Wait for the actual selected geometry instead of changing a booting ISP. */
+     for (attempt = 0; attempt < 40; attempt++) {
+         ret = pivariety_isp_read(pivariety, 0x2000, &width);
+         if (ret) return ret;
+         ret = pivariety_isp_read(pivariety, 0x2002, &height);
+         if (ret) return ret;
+         if (width == resolution->width && height == resolution->height)
+             return 0;
+         msleep(250);
+     }
+     v4l2_err(&pivariety->sd, "ISP remained %ux%u, expected %ux%u\n",
+               width, height, resolution->width, resolution->height);
+     return -ETIMEDOUT;
+ }
+ static void pivariety_x21_timing_work(struct work_struct *work)
+ {
+     struct pivariety *pivariety = container_of(to_delayed_work(work),
+                                         struct pivariety, x21_timing_work);
+     struct v4l2_ctrl *rate;
+     struct arducam_resolution *resolution;
+     int ret;
+
+     mutex_lock(&pivariety->mutex);
+     /* The handler shares this mutex; v4l2_ctrl_find() would relock it. */
+     rate = get_control(pivariety, V4L2_CID_ARDUCAM_FRAME_RATE);
+     resolution = &pivariety->supported_formats[pivariety->current_format_idx]
+                      .resolution_set[pivariety->current_resolution_idx];
+     if (pivariety->streaming && pivariety->x21_hdr &&
+         pivariety->x21_hdr->val && rate && rate->val == 30 &&
+         !pivariety->x21_fast_timing_active) {
+         ret = pivariety_x21_hdr30(pivariety);
+         if (ret)
+             v4l2_err(&pivariety->sd, "Deferred HDR setup failed: %d\n", ret);
+     } else if (x21_linear_720p120 && pivariety->streaming && rate && rate->val == 120 &&
+         pivariety->x21_arducam_openhd && pivariety->lanes == 4 &&
+         pivariety->x21_iq[X21_AE_AUTO]->val != V4L2_EXPOSURE_AUTO &&
+         resolution->width == 1280 && resolution->height == 720 &&
+         !pivariety->x21_fast_timing_active) {
+         ret = pivariety_x21_720p120(pivariety);
+         if (ret)
+             v4l2_err(&pivariety->sd, "720p120 deferred timing failed: %d\n", ret);
+     }
+     mutex_unlock(&pivariety->mutex);
+ }
+
+ static int pivariety_arducam_isp_set_fps(struct pivariety *pivariety, u32 fps)
+ {
+     struct arducam_resolution *resolution =
+         &pivariety->supported_formats[pivariety->current_format_idx]
+              .resolution_set[pivariety->current_resolution_idx];
+
+     if (pivariety->x21_hdr && pivariety->x21_hdr->val) {
+         if (fps != 30) return -ERANGE;
+         if (pivariety->streaming && !pivariety->x21_fast_timing_active)
+             mod_delayed_work(system_wq, &pivariety->x21_timing_work,
+                              msecs_to_jiffies(15000));
+         return pivariety_isp_write(pivariety, 0x2020, 30 << 8);
+     }
+     if (pivariety->x21_arducam_openhd &&
+         pivariety->x21_iq[X21_AE_AUTO]->val == V4L2_EXPOSURE_AUTO) {
+         cancel_delayed_work(&pivariety->x21_timing_work);
+         return pivariety_x21_auto_fps(pivariety, fps);
+     }
+     if (x21_linear_720p120 && pivariety->x21_arducam_openhd &&
+         pivariety->x21_iq[X21_AE_AUTO]->val != V4L2_EXPOSURE_AUTO &&
+         pivariety->lanes == 4 && fps == 120 &&
+         resolution->width == 1280 && resolution->height == 720 &&
+         !pivariety->x21_fast_timing_active) {
+         /* Let capture return its initial buffers before stop/reacquire. */
+         if (pivariety->streaming)
+             mod_delayed_work(system_wq, &pivariety->x21_timing_work,
+                              msecs_to_jiffies(15000));
+         return pivariety_isp_write(pivariety, 0x2020, 60 << 8);
+     }
+     cancel_delayed_work(&pivariety->x21_timing_work);
+
+     /* The supplied ISP MCU firmware's frame-rate setter is empty.
+      * Use its existing volatile 16-bit ISP-register bridge instead.
+      * PREVIEW_MAX_FPS is Q8.8; this does not change PLLs or sensor timing. */
+     return pivariety_isp_write(pivariety, 0x2020, fps << 8);
+ }
+
  static int pivariety_s_ctrl(struct v4l2_ctrl *ctrl)
  {
      int ret, i;
@@ -445,15 +921,67 @@ static struct rkmodule_csi_dphy_param dcphy_param = {
                   ctrl_handler);
      struct arducam_format *supported_fmts = pivariety->supported_formats;
      int num_supported_formats = pivariety->num_supported_formats;
+
+     i = pivariety_x21_iq_index(ctrl->id);
+     if (pivariety->x21_arducam_openhd && pivariety->arducam_isp &&
+         pivariety->lanes == 4 && i >= 0) {
+         /* A queued Fly correction must not affect a newer Manual/Normal
+          * selection. Neutral is always allowed for cleanup. */
+         if (i == X21_AE_BIAS && ctrl->val != 8 &&
+             (pivariety->x21_iq[X21_AE_AUTO]->val != V4L2_EXPOSURE_AUTO ||
+              pivariety->x21_iq[X21_AE_SCENE]->val != V4L2_SCENE_MODE_BACKLIGHT))
+             return -EBUSY;
+         /* Three-exposure HDR still uses an explicit sensor table. Ordinary
+          * 720p120 can instead use native AE with the preview FPS cap. */
+         if (i == X21_AE_AUTO && ctrl->val == V4L2_EXPOSURE_AUTO) {
+             if (pivariety->x21_hdr && pivariety->x21_hdr->val)
+                 return -EOPNOTSUPP;
+         }
+         return pivariety_x21_apply_iq(pivariety, i, ctrl->val);
+     }
+
+     if (pivariety->x21_arducam_openhd && ctrl->id == V4L2_CID_WIDE_DYNAMIC_RANGE) {
+         struct v4l2_ctrl *rate;
+         if (pivariety->streaming) return -EBUSY;
+         if (ctrl->val && pivariety->x21_iq[X21_AE_AUTO] &&
+             pivariety->x21_iq[X21_AE_AUTO]->val == V4L2_EXPOSURE_AUTO)
+             return -EOPNOTSUPP;
+         rate = get_control(pivariety, V4L2_CID_ARDUCAM_FRAME_RATE);
+         if (!rate) return -EINVAL;
+         return __v4l2_ctrl_modify_range(rate, 30,
+             pivariety_arducam_isp_max_fps(pivariety), 1, 30);
+     }
+
+     /* Do not call the empty vendor FPS setter. The ISP is reloaded at
+      * stream-on; apply cached FPS there, or directly while streaming. */
+     if (pivariety->arducam_isp && ctrl->id == V4L2_CID_ARDUCAM_FRAME_RATE) {
+         if (pivariety->x21_arducam_openhd &&
+             ctrl->val > pivariety_arducam_isp_max_fps(pivariety))
+             return -ERANGE;
+         return pivariety->streaming ?
+             pivariety_arducam_isp_set_fps(pivariety, ctrl->val) : 0;
+     }
  
      v4l2_dbg(3, debug, &pivariety->sd, "%s: cid = (0x%X), value = (%d).\n",
           __func__, ctrl->id, ctrl->val);
  
+     ret = wait_for_free(pivariety, 1);
+     if (ret)
+         return ret;
      ret = pivariety_write(pivariety, CTRL_ID_REG, ctrl->id);
-     ret += pivariety_write(pivariety, CTRL_VALUE_REG, ctrl->val);
-     if (ret < 0)
-         return -EINVAL;
- 
+     if (ret)
+         return ret;
+     ret = wait_for_free(pivariety, 1);
+     if (ret)
+         return ret;
+     ret = pivariety_write(pivariety, CTRL_VALUE_REG, ctrl->val);
+     if (ret)
+         return ret;
+     /* The ISP must finish each command before the next control/stream-on. */
+     ret = wait_for_free(pivariety, 1);
+     if (ret)
+         return ret;
+
      /* When flip is set, modify all bayer formats */
      if (ctrl->id == V4L2_CID_VFLIP || ctrl->id == V4L2_CID_HFLIP) {
          for (i = 0; i < num_supported_formats; i++) {
@@ -521,6 +1049,33 @@ static struct rkmodule_csi_dphy_param dcphy_param = {
      return -EINVAL;
  }
  
+ static int pivariety_enum_frame_interval(struct v4l2_subdev *sd,
+                      struct v4l2_subdev_state *state,
+                      struct v4l2_subdev_frame_interval_enum *fie)
+ {
+     static const unsigned int fps[] = {30, 60, 120};
+     struct pivariety *pivariety = to_pivariety(sd);
+     unsigned int count;
+
+     if (!pivariety->x21_arducam_openhd || fie->pad ||
+         fie->code != MEDIA_BUS_FMT_UYVY8_1X16)
+         return -EINVAL;
+     if (fie->width == 1280 && fie->height == 720)
+         count = 3;
+     else if (fie->width == 1920 && fie->height == 1080)
+         count = 2;
+     else
+         return -EINVAL;
+     if (pivariety->x21_hdr && pivariety->x21_hdr->val)
+         count = 1;
+     if (fie->index >= count)
+         return -EINVAL;
+     /* Interval enumeration describes selectable linear output modes. */
+     fie->interval.numerator = 1;
+     fie->interval.denominator = fps[fie->index];
+     return 0;
+ }
+
  static int pivariety_get_fmt(struct v4l2_subdev *sd,
                   struct v4l2_subdev_state *sd_state,
                   struct v4l2_subdev_format *format)
@@ -534,6 +1089,12 @@ static struct rkmodule_csi_dphy_param dcphy_param = {
          return -EINVAL;
  
      mutex_lock(&pivariety->mutex);
+
+     if (format->which == V4L2_SUBDEV_FORMAT_TRY) {
+         format->format = *v4l2_subdev_get_try_format(sd, sd_state, 0);
+         mutex_unlock(&pivariety->mutex);
+         return 0;
+     }
 
      current_format =
          &pivariety->supported_formats[pivariety->current_format_idx];
@@ -639,6 +1200,12 @@ static struct rkmodule_csi_dphy_param dcphy_param = {
           __func__, min, max, step, def);
  
      ctrl = get_control(pivariety, id);
+     if (!ctrl)
+         return -EINVAL;
+     if (pivariety->x21_arducam_openhd && id == V4L2_CID_ARDUCAM_FRAME_RATE) {
+         max = min(max, pivariety_arducam_isp_max_fps(pivariety));
+         def = min(def, max);
+     }
      return __v4l2_ctrl_modify_range(ctrl, min, max, step, def);
  
  err:
@@ -664,7 +1231,7 @@ static struct rkmodule_csi_dphy_param dcphy_param = {
                   struct v4l2_subdev_state *sd_state,
                   struct v4l2_subdev_format *format)
  {
-     int i, j;
+     int i, j, ret = 0;
      struct pivariety *pivariety = to_pivariety(sd);
      struct arducam_format *supported_formats = pivariety->supported_formats;
  
@@ -672,6 +1239,11 @@ static struct rkmodule_csi_dphy_param dcphy_param = {
          return -EINVAL;
  
      mutex_lock(&pivariety->mutex);
+
+     if (format->which == V4L2_SUBDEV_FORMAT_ACTIVE && pivariety->streaming) {
+         mutex_unlock(&pivariety->mutex);
+         return -EBUSY;
+     }
  
      format->format.colorspace = V4L2_COLORSPACE_RAW;
      format->format.field = V4L2_FIELD_NONE;
@@ -696,15 +1268,24 @@ static struct rkmodule_csi_dphy_param dcphy_param = {
              v4l2_dbg(1, debug, sd,
                   "%s: set format to device: %d %d.\n",
                   __func__, supported_formats[i].index, j);
+
+             if (format->which == V4L2_SUBDEV_FORMAT_TRY) {
+                 *v4l2_subdev_get_try_format(sd, sd_state, 0) = format->format;
+                 goto unlock;
+             }
  
-             pivariety_write(pivariety, PIXFORMAT_INDEX_REG,
+             ret = pivariety_write(pivariety, PIXFORMAT_INDEX_REG,
                      supported_formats[i].index);
-             pivariety_write(pivariety, RESOLUTION_INDEX_REG, j);
+             if (ret)
+                 goto unlock;
+             ret = pivariety_write(pivariety, RESOLUTION_INDEX_REG, j);
+             if (ret)
+                 goto unlock;
  
              pivariety->current_format_idx = i;
              pivariety->current_resolution_idx = j;
  
-             update_controls(pivariety);
+             ret = update_controls(pivariety);
  
              goto unlock;
          }
@@ -712,20 +1293,29 @@ static struct rkmodule_csi_dphy_param dcphy_param = {
  
      format->format.width = supported_formats[i].resolution_set[0].width;
      format->format.height = supported_formats[i].resolution_set[0].height;
+
+     if (format->which == V4L2_SUBDEV_FORMAT_TRY) {
+         *v4l2_subdev_get_try_format(sd, sd_state, 0) = format->format;
+         goto unlock;
+     }
  
-     pivariety_write(pivariety, PIXFORMAT_INDEX_REG,
+     ret = pivariety_write(pivariety, PIXFORMAT_INDEX_REG,
              supported_formats[i].index);
-     pivariety_write(pivariety, RESOLUTION_INDEX_REG, 0);
+     if (ret)
+         goto unlock;
+     ret = pivariety_write(pivariety, RESOLUTION_INDEX_REG, 0);
+     if (ret)
+         goto unlock;
  
      pivariety->current_format_idx = i;
      pivariety->current_resolution_idx = 0;
-     update_controls(pivariety);
+     ret = update_controls(pivariety);
  
  unlock:
  
      mutex_unlock(&pivariety->mutex);
  
-     return 0;
+     return ret;
  }
  
  /* Start streaming */
@@ -736,94 +1326,53 @@ static struct rkmodule_csi_dphy_param dcphy_param = {
      /* set stream on register */
      ret = pivariety_write(pivariety, MODE_SELECT_REG,
                    ARDUCAM_MODE_STREAMING);
-
-
-     return ret;
- }
- 
- static int pivariety_read_sel(struct pivariety *pivariety,
-                   struct v4l2_rect *rect)
- {
-     int ret = 0;
- 
-     ret += pivariety_read(pivariety, IPC_SEL_TOP_REG, &rect->top);
-     ret += pivariety_read(pivariety, IPC_SEL_LEFT_REG, &rect->left);
-     ret += pivariety_read(pivariety, IPC_SEL_WIDTH_REG, &rect->width);
-     ret += pivariety_read(pivariety, IPC_SEL_HEIGHT_REG, &rect->height);
- 
-     if (ret || rect->top == NO_DATA_AVAILABLE ||
-         rect->left == NO_DATA_AVAILABLE ||
-         rect->width == NO_DATA_AVAILABLE ||
-         rect->height == NO_DATA_AVAILABLE) {
-         v4l2_err(&pivariety->sd, "%s: Failed to read selection.\n",
-              __func__);
-         return -EINVAL;
-         }
- 
-     return 0;
- }
- 
- static const struct v4l2_rect *
- __pivariety_get_pad_crop(struct pivariety *pivariety,
-              struct v4l2_subdev_state *sd_state,
-              unsigned int pad,
-              enum v4l2_subdev_format_whence which)
- {
-     int ret;
- 
-     switch (which) {
-     case V4L2_SUBDEV_FORMAT_TRY:
-         return v4l2_subdev_get_try_crop(&pivariety->sd, sd_state, pad);
-     case V4L2_SUBDEV_FORMAT_ACTIVE:
-         ret = pivariety_read_sel(pivariety, &pivariety->crop);
-         if (ret)
-             return NULL;
-         return &pivariety->crop;
+     if (!ret && pivariety->arducam_isp) {
+         /* Command ACK precedes the MCU's ISP reload (about six seconds).
+          * Give its command queue time to dispatch before checking busy. */
+         msleep(20);
+         ret = wait_for_free_timeout(pivariety, 5, 10000);
      }
- 
-     return NULL;
+     return ret;
  }
  
  static int pivariety_get_selection(struct v4l2_subdev *sd,
                     struct v4l2_subdev_state *sd_state,
                     struct v4l2_subdev_selection *sel)
  {
-     int ret = 0;
-     struct v4l2_rect rect;
      struct pivariety *pivariety = to_pivariety(sd);
- 
-     ret = pivariety_write(pivariety, IPC_SEL_TARGET_REG, sel->target);
-     if (ret) {
-         v4l2_err(sd, "%s: Write register 0x%02x failed\n",
-              __func__, IPC_SEL_TARGET_REG);
+     struct arducam_resolution *resolution;
+
+     if (sel->pad != 0)
          return -EINVAL;
-     }
- 
-     wait_for_free(pivariety, 2);
- 
      switch (sel->target) {
-     case V4L2_SEL_TGT_CROP: {
-         mutex_lock(&pivariety->mutex);
-         sel->r = *__pivariety_get_pad_crop(pivariety, sd_state,
-                            sel->pad,
-                            sel->which);
-         mutex_unlock(&pivariety->mutex);
- 
-         return 0;
-     }
- 
+     case V4L2_SEL_TGT_CROP:
      case V4L2_SEL_TGT_NATIVE_SIZE:
      case V4L2_SEL_TGT_CROP_DEFAULT:
      case V4L2_SEL_TGT_CROP_BOUNDS:
-         ret = pivariety_read_sel(pivariety, &rect);
-         if (ret)
-             return -EINVAL;
- 
-         sel->r = rect;
-         return 0;
+         break;
+     default:
+         return -EINVAL;
      }
- 
-     return -EINVAL;
+
+     /* No subdevice crop setter is exposed. The selected mode is the full
+      * output rectangle. ISP IPC geometry still describes the previous mode
+      * until stream-on; using it prevents CIF from enlarging 720p to 1080p. */
+     mutex_lock(&pivariety->mutex);
+     sel->r.left = 0;
+     sel->r.top = 0;
+     if (sel->which == V4L2_SUBDEV_FORMAT_TRY) {
+         struct v4l2_mbus_framefmt *format =
+             v4l2_subdev_get_try_format(sd, sd_state, sel->pad);
+         sel->r.width = format->width;
+         sel->r.height = format->height;
+     } else {
+         resolution = &pivariety->supported_formats[pivariety->current_format_idx]
+             .resolution_set[pivariety->current_resolution_idx];
+         sel->r.width = resolution->width;
+         sel->r.height = resolution->height;
+     }
+     mutex_unlock(&pivariety->mutex);
+     return 0;
  }
  
  /* Stop streaming */
@@ -847,6 +1396,7 @@ static struct rkmodule_csi_dphy_param dcphy_param = {
  {
      struct pivariety *pivariety = to_pivariety(sd);
      struct i2c_client *client = v4l2_get_subdevdata(sd);
+     struct v4l2_ctrl *frame_rate = NULL;
      int ret = 0;
  
      mutex_lock(&pivariety->mutex);
@@ -856,6 +1406,8 @@ static struct rkmodule_csi_dphy_param dcphy_param = {
      }
  
      if (enable) {
+         pivariety->x21_fast_timing_active = false;
+         pivariety->x21_ae_scene.valid = 0;
          ret = pm_runtime_get_sync(&client->dev);
          if (ret < 0) {
              pm_runtime_put_noidle(&client->dev);
@@ -863,19 +1415,72 @@ static struct rkmodule_csi_dphy_param dcphy_param = {
          }
  
          /*
-          * Apply default & customized values
-          * and then start streaming.
+          * Pivariety has no guaranteed default mode. Runtime resume may
+          * restart its ISP, so program the cached selection while powered,
+          * then apply controls before enabling the UYVY stream.
           */
+         ret = pivariety_write(pivariety, PIXFORMAT_INDEX_REG,
+             pivariety->supported_formats[pivariety->current_format_idx].index);
+         if (ret)
+             goto err_rpm_put;
+         ret = pivariety_write(pivariety, RESOLUTION_INDEX_REG,
+                              pivariety->current_resolution_idx);
+         if (ret)
+             goto err_rpm_put;
+         ret = wait_for_free(pivariety, 5);
+         if (ret)
+             goto err_rpm_put;
+         ret = __v4l2_ctrl_handler_setup(pivariety->sd.ctrl_handler);
+         if (ret)
+             goto err_rpm_put;
+         ret = wait_for_free(pivariety, 5);
+         if (ret)
+             goto err_rpm_put;
          ret = pivariety_start_streaming(pivariety);
          if (ret)
              goto err_rpm_put;
+         ret = pivariety_x21_restore_geometry(pivariety);
+         if (ret) {
+             dev_err(&client->dev, "ISP output geometry setup failed: %d\n", ret);
+             goto err_stop_stream;
+         }
+         /* ARDUCAM_OPENHD/ISP reloads the ISP and mode defaults on stream-on.
+          * Reapply FPS afterwards, while keeping flip controls before start.
+          * Call the setter directly: the cached value has not changed, so
+          * __v4l2_ctrl_s_ctrl() may otherwise skip the hardware transaction. */
+         ret = wait_for_free(pivariety, 5);
+         if (ret)
+             goto err_stop_stream;
+         frame_rate = get_control(pivariety, V4L2_CID_ARDUCAM_FRAME_RATE);
+         if (frame_rate) {
+             ret = pivariety->arducam_isp ?
+                   pivariety_arducam_isp_set_fps(pivariety, frame_rate->val) :
+                   pivariety_s_ctrl(frame_rate);
+             if (ret)
+                 goto err_stop_stream;
+         }
      } else {
+         cancel_delayed_work(&pivariety->x21_timing_work);
          pivariety_stop_streaming(pivariety);
+         pivariety->x21_fast_timing_active = false;
          pm_runtime_put(&client->dev);
      }
  
      pivariety->streaming = enable;
+     if (enable && pivariety->x21_arducam_openhd) {
+         ret = pivariety_x21_restore_iq(pivariety);
+         if (ret) goto err_stop_stream;
+     }
+     if (enable && pivariety->x21_arducam_openhd && frame_rate &&
+         ((x21_linear_720p120 && frame_rate->val == 120 &&
+           pivariety->x21_iq[X21_AE_AUTO]->val != V4L2_EXPOSURE_AUTO) ||
+          (pivariety->x21_hdr && pivariety->x21_hdr->val)))
+         mod_delayed_work(system_wq, &pivariety->x21_timing_work,
+                          msecs_to_jiffies(15000));
  
+     if (pivariety->x21_hdr)
+         __v4l2_ctrl_grab(pivariety->x21_hdr, enable);
+
      /*
       * vflip and hflip cannot change during streaming
       * Pivariety may not implement flip control.
@@ -890,6 +1495,10 @@ static struct rkmodule_csi_dphy_param dcphy_param = {
  
      return ret;
  
+ err_stop_stream:
+     pivariety->streaming = false;
+     pivariety->x21_fast_timing_active = false;
+     pivariety_stop_streaming(pivariety);
  err_rpm_put:
      pm_runtime_put(&client->dev);
  err_unlock:
@@ -904,8 +1513,12 @@ static struct rkmodule_csi_dphy_param dcphy_param = {
      struct v4l2_subdev *sd = i2c_get_clientdata(client);
      struct pivariety *pivariety = to_pivariety(sd);
  
+     cancel_delayed_work_sync(&pivariety->x21_timing_work);
+     mutex_lock(&pivariety->mutex);
+     pivariety->x21_fast_timing_active = false;
      if (pivariety->streaming)
          pivariety_stop_streaming(pivariety);
+     mutex_unlock(&pivariety->mutex);
  
      return 0;
  }
@@ -915,29 +1528,66 @@ static struct rkmodule_csi_dphy_param dcphy_param = {
      struct i2c_client *client = to_i2c_client(dev);
      struct v4l2_subdev *sd = i2c_get_clientdata(client);
      struct pivariety *pivariety = to_pivariety(sd);
+     struct v4l2_ctrl *rate;
      int ret;
  
+     mutex_lock(&pivariety->mutex);
      if (pivariety->streaming) {
          ret = pivariety_start_streaming(pivariety);
          if (ret)
              goto error;
+         rate = get_control(pivariety, V4L2_CID_ARDUCAM_FRAME_RATE);
+         if (rate && pivariety->arducam_isp) {
+             ret = pivariety_arducam_isp_set_fps(pivariety, rate->val);
+             if (ret)
+                 goto error;
+         }
      }
  
+     mutex_unlock(&pivariety->mutex);
      return 0;
  
  error:
      pivariety_stop_streaming(pivariety);
      pivariety->streaming = 0;
+     mutex_unlock(&pivariety->mutex);
      return ret;
  }
  
 static int ardu_g_frame_interval(struct v4l2_subdev *sd,
 				    struct v4l2_subdev_frame_interval *fi)
 {
-    fi->interval.numerator = 10000;
-	fi->interval.denominator = 600000;
+    struct pivariety *pivariety = to_pivariety(sd);
+    struct v4l2_ctrl *ctrl = get_control(pivariety, V4L2_CID_ARDUCAM_FRAME_RATE);
 
-	return 0;
+    if (fi->pad || !ctrl)
+        return -EINVAL;
+    mutex_lock(&pivariety->mutex);
+    fi->interval.numerator = 1;
+    fi->interval.denominator = ctrl->val;
+    mutex_unlock(&pivariety->mutex);
+    return 0;
+}
+
+static int ardu_s_frame_interval(struct v4l2_subdev *sd,
+                                struct v4l2_subdev_frame_interval *fi)
+{
+    struct pivariety *pivariety = to_pivariety(sd);
+    struct v4l2_ctrl *ctrl = get_control(pivariety, V4L2_CID_ARDUCAM_FRAME_RATE);
+    u32 fps;
+    int ret;
+
+    if (fi->pad || !ctrl || !fi->interval.numerator || !fi->interval.denominator)
+        return -EINVAL;
+    fps = DIV_ROUND_CLOSEST(fi->interval.denominator, fi->interval.numerator);
+    if (pivariety->x21_arducam_openhd)
+        fps = min(fps, pivariety_arducam_isp_max_fps(pivariety));
+    ret = v4l2_ctrl_s_ctrl(ctrl, fps);
+    if (ret)
+        return ret;
+    fi->interval.numerator = 1;
+    fi->interval.denominator = fps;
+    return 0;
 }
 
  static int pivariety_get_regulators(struct pivariety *pivariety)
@@ -983,8 +1633,11 @@ static int pivariety_get_channel_info(struct pivariety *pivariety, struct rkmodu
 {
 	if (ch_info->index < PAD0 || ch_info->index >= PAD_MAX)
 		return -EINVAL;
-    ch_info->width = pivariety->supported_formats[pivariety->current_format_idx].resolution_set->width;
-	ch_info->height = pivariety->supported_formats[pivariety->current_format_idx].resolution_set->height;
+    ch_info->width = pivariety->supported_formats[pivariety->current_format_idx]
+        .resolution_set[pivariety->current_resolution_idx].width;
+	ch_info->height = pivariety->supported_formats[pivariety->current_format_idx]
+        .resolution_set[pivariety->current_resolution_idx].height;
+	ch_info->vc = 0;
 	ch_info->bus_fmt = pivariety->supported_formats[pivariety->current_format_idx].mbus_code; // Sketchy
 	return 0;
 }
@@ -1145,6 +1798,7 @@ static int pivariety_get_channel_info(struct pivariety *pivariety, struct rkmodu
  static const struct v4l2_subdev_video_ops pivariety_video_ops = {
      .s_stream = pivariety_set_stream,
      .g_frame_interval =ardu_g_frame_interval,
+     .s_frame_interval =ardu_s_frame_interval,
  };
  
  static const struct v4l2_subdev_pad_ops pivariety_pad_ops = {
@@ -1152,6 +1806,7 @@ static int pivariety_get_channel_info(struct pivariety *pivariety, struct rkmodu
      .get_fmt = pivariety_get_fmt,
      .set_fmt = pivariety_set_fmt,
      .enum_frame_size = pivariety_enum_framesizes,
+     .enum_frame_interval = pivariety_enum_frame_interval,
      .get_selection = pivariety_get_selection,
      .get_mbus_config = pivariety_get_mbus_config,
  };
@@ -1322,6 +1977,8 @@ static int pivariety_get_channel_info(struct pivariety *pivariety, struct rkmodu
  static const char *pivariety_ctrl_get_name(u32 id)
  {
      switch (id) {
+     case V4L2_CID_ARDUCAM_FRAME_RATE:
+         return "frame_rate";
      case V4L2_CID_ARDUCAM_EXT_TRI:
          return "trigger_mode";
      case V4L2_CID_ARDUCAM_IRCUT:
@@ -1394,6 +2051,7 @@ static int pivariety_get_channel_info(struct pivariety *pivariety, struct rkmodu
      ret = v4l2_ctrl_handler_init(ctrl_hdlr, num_ctrls);
      if (ret)
          return ret;
+     ctrl_hdlr->lock = &pivariety->mutex;
  
           ctrl1 = v4l2_ctrl_new_int_menu(ctrl_hdlr, NULL, V4L2_CID_LINK_FREQ,
 				      0, 0, link_freq_menu_items);
@@ -1418,11 +2076,24 @@ static int pivariety_get_channel_info(struct pivariety *pivariety, struct rkmodu
              min == NO_DATA_AVAILABLE || def == NO_DATA_AVAILABLE ||
              step == NO_DATA_AVAILABLE)
              break;
+
+         /* Replace MCU-advertised IQ entries with standard ISP-backed
+          * controls below, rather than registering duplicate IDs. */
+         if (pivariety->x21_arducam_openhd && pivariety->arducam_isp &&
+             pivariety->lanes == 4 && pivariety_x21_iq_index(id) >= 0) {
+             index++;
+             continue;
+         }
  
          v4l2_dbg(1, debug, sd,
               "%s: index = %d, id = 0x%x, max = %d, min = %d, def = %d, step = %d\n",
               __func__, index, id, max, min, def, step);
  
+         if (pivariety->x21_arducam_openhd && id == V4L2_CID_ARDUCAM_FRAME_RATE) {
+             max = min(max, pivariety_arducam_isp_max_fps(pivariety));
+             def = clamp_t(u32, 30, min, max);
+         }
+
          if (v4l2_ctrl_get_name(id)) {
              *ctrl = v4l2_ctrl_new_std(ctrl_hdlr,
                            &pivariety_ctrl_ops,
@@ -1473,6 +2144,48 @@ static int pivariety_get_channel_info(struct pivariety *pivariety, struct rkmodu
  
      pivariety_write(pivariety, CTRL_INDEX_REG, 0);
  
+     if (pivariety->x21_arducam_openhd && pivariety->arducam_isp && pivariety->lanes == 4) {
+         pivariety->x21_hdr = v4l2_ctrl_new_std(ctrl_hdlr,
+             &pivariety_ctrl_ops, V4L2_CID_WIDE_DYNAMIC_RANGE, 0, 1, 1, 0);
+         if (!pivariety->x21_hdr) goto err;
+         {
+             static const struct { int min, max, step, def; } iq[] = {
+                 {1,40,1,10}, /* 100 us, not sensor lines */
+                 {256,2048,16,256}, /* U8.8 */
+                 {0,1,1,1},
+                 {2000,10000,100,6500},
+                 {-4096,4096,1,0}, /* S3.12 */
+                 {0,8192,1,4096},
+                 {0,8192,1,4096},
+                 {0,8192,1,0}, /* 0 selects ISP sRGB */
+             };
+             unsigned int i;
+             for (i = 0; i < ARRAY_SIZE(iq); i++) {
+                 pivariety->x21_iq[i] = v4l2_ctrl_new_std(ctrl_hdlr,
+                     &pivariety_ctrl_ops, x21_iq_ids[i], iq[i].min,
+                     iq[i].max, iq[i].step, iq[i].def);
+                 if (!pivariety->x21_iq[i]) goto err;
+             }
+             pivariety->x21_iq[X21_AE_AUTO] = v4l2_ctrl_new_std_menu(ctrl_hdlr,
+                 &pivariety_ctrl_ops, V4L2_CID_EXPOSURE_AUTO,
+                 V4L2_EXPOSURE_MANUAL, 0, V4L2_EXPOSURE_AUTO);
+             if (!pivariety->x21_iq[X21_AE_AUTO]) goto err;
+             pivariety->x21_iq[X21_AE_SCENE] = v4l2_ctrl_new_std_menu(ctrl_hdlr,
+                 &pivariety_ctrl_ops, V4L2_CID_SCENE_MODE, V4L2_SCENE_MODE_SPORTS,
+                 ((1ULL << (V4L2_SCENE_MODE_SPORTS + 1)) - 1) &
+                 ~((1ULL << V4L2_SCENE_MODE_NONE) | (1ULL << V4L2_SCENE_MODE_BACKLIGHT) |
+                   (1ULL << V4L2_SCENE_MODE_SPORTS)), V4L2_SCENE_MODE_NONE);
+             if (!pivariety->x21_iq[X21_AE_SCENE]) goto err;
+             {
+                 static const s64 ev[] = {-2000,-1750,-1500,-1250,-1000,-750,-500,-250,
+                                           0,250,500,750,1000,1250,1500,1750,2000};
+                 pivariety->x21_iq[X21_AE_BIAS] = v4l2_ctrl_new_int_menu(ctrl_hdlr,
+                     &pivariety_ctrl_ops, V4L2_CID_AUTO_EXPOSURE_BIAS, 16, 8, ev);
+                 if (!pivariety->x21_iq[X21_AE_BIAS]) goto err;
+             }
+         }
+     }
+
      ret = v4l2_fwnode_device_parse(&client->dev, &props);
      if (ret)
          goto err;
@@ -1526,12 +2239,17 @@ static int pivariety_probe(struct i2c_client *client,
     
         struct device *dev = &client->dev;
         struct pivariety *pivariety;
-        u32 device_id, firmware_version;
+        u32 device_id, firmware_version, sensor_id;
         int ret;
 
         pivariety = devm_kzalloc(dev, sizeof(*pivariety), GFP_KERNEL);
         if (!pivariety)
         return -ENOMEM;
+        mutex_init(&pivariety->mutex);
+        INIT_DELAYED_WORK(&pivariety->x21_timing_work,
+                          pivariety_x21_timing_work);
+        pivariety->x21_arducam_openhd = of_device_is_compatible(dev->of_node,
+                                      "openhd,x21-arducam_openhd");
 
         /* Initialize subdev */
         v4l2_i2c_subdev_init(&pivariety->sd, client, &pivariety_subdev_ops);
@@ -1550,18 +2268,10 @@ static int pivariety_probe(struct i2c_client *client,
         return ret;
         }
 
-        /* Register sensor to V4L2 async framework */
-        dev_info(dev, "pivariety: registering subdevice with V4L2 async\n");
-        ret = v4l2_async_register_subdev_sensor(&pivariety->sd);
-        if (ret < 0) {
-                dev_err(dev, "pivariety: subdev registration failed: %d\n", ret);
-                goto error_media_entity;
-        }
-
         /* Parse device tree */
         if (pivariety_parse_dt(pivariety, dev)) {
         ret = -EINVAL;
-        goto error_unregister_subdev;
+        goto error_media_entity;
         }
 
         /* Get system clock (xclk) */
@@ -1569,7 +2279,7 @@ static int pivariety_probe(struct i2c_client *client,
         if (IS_ERR(pivariety->xclk)) {
         dev_err(dev, "failed to get xclk\n");
         ret = PTR_ERR(pivariety->xclk);
-        goto error_unregister_subdev;
+        goto error_media_entity;
         }
 
         pivariety->xclk_freq = clk_get_rate(pivariety->xclk);
@@ -1577,13 +2287,13 @@ static int pivariety_probe(struct i2c_client *client,
         dev_err(dev, "xclk frequency not supported: %d Hz\n",
         pivariety->xclk_freq);
         ret = -EINVAL;
-        goto error_unregister_subdev;
+        goto error_media_entity;
         }
 
         /* Get optional power regulators */
         ret = pivariety_get_regulators(pivariety);
         if (ret)
-        goto error_unregister_subdev;
+        goto error_media_entity;
 
         /* Optional reset GPIO */
         pivariety->reset_gpio = devm_gpiod_get_optional(dev, "reset",
@@ -1592,7 +2302,7 @@ static int pivariety_probe(struct i2c_client *client,
         /* Power on the device */
         ret = pivariety_power_on(dev);
         if (ret)
-        goto error_unregister_subdev;
+        goto error_media_entity;
 
         /* Read ID and firmware version */
         ret = pivariety_read(pivariety, DEVICE_ID_REG, &device_id);
@@ -1604,9 +2314,20 @@ static int pivariety_probe(struct i2c_client *client,
 
         ret = pivariety_read(pivariety, DEVICE_VERSION_REG, &firmware_version);
         if (ret)
-        dev_warn(dev, "read firmware version failed\n");
+            goto error_power_off;
 
         dev_info(dev, "firmware version: 0x%04X\n", firmware_version);
+
+        ret = pivariety_read(pivariety, SENSOR_ID_REG, &sensor_id);
+        if (ret)
+            goto error_power_off;
+        pivariety->arducam_isp = sensor_id == 0x1302;
+
+        /* Explicit board/module profile only; ordinary Pivariety cameras
+         * retain their firmware. Runs before any capture client can open it. */
+        ret = pivariety_ensure_x21_firmware(pivariety);
+        if (ret)
+            goto error_power_off;
 
         /* Enumerate formats and controls */
         if (pivariety_enum_pixformat(pivariety)) {
@@ -1621,6 +2342,11 @@ static int pivariety_probe(struct i2c_client *client,
         goto error_power_off;
         }
 
+        /* Publish only after formats, controls and their lock are ready. */
+        ret = v4l2_async_register_subdev_sensor(&pivariety->sd);
+        if (ret < 0)
+            goto error_power_off;
+
         pm_runtime_set_active(dev);
         pm_runtime_enable(dev);
         pm_runtime_idle(dev);
@@ -1629,9 +2355,6 @@ static int pivariety_probe(struct i2c_client *client,
 
         error_power_off:
         pivariety_power_off(dev);
-
-        error_unregister_subdev:
-        v4l2_async_unregister_subdev(&pivariety->sd);
 
         error_media_entity:
         media_entity_cleanup(&pivariety->sd.entity);
@@ -1646,6 +2369,7 @@ static void pivariety_remove(struct i2c_client *client)
      struct pivariety *pivariety = to_pivariety(sd);
  
      v4l2_async_unregister_subdev(sd);
+     cancel_delayed_work_sync(&pivariety->x21_timing_work);
      media_entity_cleanup(&sd->entity);
      pivariety_free_controls(pivariety);
  
@@ -1659,6 +2383,7 @@ static void pivariety_remove(struct i2c_client *client)
  };
  
  static const struct of_device_id arducam_pivariety_dt_ids[] = {
+     { .compatible = "openhd,x21-arducam_openhd" },
      { .compatible = "arducam,arducam-pivariety" },
      { /* sentinel */ }
  };
