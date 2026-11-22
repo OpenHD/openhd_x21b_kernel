@@ -428,14 +428,13 @@
 };
 
 &sdmmc0 {
-	max-frequency = <200000000>;
+	max-frequency = <50000000>;
 	no-sdio;
 	no-mmc;
 	bus-width = <4>;
-	cap-mmc-highspeed;
 	cap-sd-highspeed;
 	disable-wp;
-	sd-uhs-sdr104;
+	no-1-8-v;
 	vmmc-supply = <&vcc3v3_sd>;
 	vqmmc-supply = <&vccio_sd>;
 	status = "okay";
